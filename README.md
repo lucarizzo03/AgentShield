@@ -72,6 +72,68 @@ For each cycle, the brain:
    - `mpp_execution` status/details
    - final top-level `decision`
 
+## How Reasoning Works
+
+The agent does not submit a single blind payment request. It uses a cycle-based reasoning loop in `agentShieldAgent.py`:
+
+1. `sync_ledger`
+  - Pulls current session/daily spend from gateway ledger.
+  - Prevents stale metadata from causing false rejects.
+
+2. `prepare_request`
+  - Builds a request using the current candidate vendor/amount.
+  - Generates a fresh challenge ID and includes retry metadata.
+
+3. `authorize`
+  - Calls gateway authorization logic.
+  - If approved, loop stops immediately with signed payment intent.
+  - If rejected, moves to reflection.
+
+4. `reflect_adjust`
+  - Reads `audit_log` and `rejection_guidance`.
+  - Applies strategy updates:
+    - switch candidate if context/vendor mismatch
+    - reduce amount for value/benchmark rejects
+    - reduce amount for velocity/cap pressure
+    - normalize currency if policy requires USD
+    - refresh ledger if mismatch is detected
+  - Retries until approved, max cycles reached, or candidates exhausted.
+
+This is the core "reasoning" behavior: inspect rejection cause, adapt request, and retry in a controlled loop.
+
+## What Must Pass For Approval
+
+A payment must pass all of the following in sequence inside `authorize_spend`:
+
+1. Security and policy gates (pre-checks)
+  - Agent ID must be registered.
+  - MPP challenge ID must not be reused.
+  - Currency must match policy (`USD` unless multi-currency enabled).
+  - Agent-reported session spend must match gateway ledger.
+
+2. Check 1: Context Alignment
+  - Vendor must be verifiable (HTTPS, plausible identity).
+  - Vendor must logically match task intent.
+  - Requested amount must be proportional for known scope patterns.
+
+3. Check 2: Velocity
+  - Projected daily spend must remain under daily cap.
+  - Retry-loop heuristics must not trigger.
+  - Velocity spike heuristics must not trigger.
+  - Micro-payment flood threshold must not be exceeded.
+
+4. Check 3: Value Assessment
+  - Amount must fit benchmark range for inferred service type.
+  - Above-benchmark spend requires contextual premium justification.
+  - Recurring spend is guarded and requires owner confirmation flow.
+
+Only when all checks pass does gateway issue `signed_payment_intent`.
+
+Then `/v1/process-payment` attempts MPP execution:
+
+- If MPP execution returns `SUCCEEDED` or `PENDING`, final decision is `APPROVED`.
+- Otherwise final decision is `REJECTED` (authorization may still be approved, but execution failed/skipped).
+
 ## API Endpoints
 
 ## `POST /v1/authorize-spend`
