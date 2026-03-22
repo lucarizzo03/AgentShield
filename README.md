@@ -1,242 +1,247 @@
 # Budget Shield Gateway + Agent Brain
 
-This project is a two-layer autonomous payment governance system:
+This repository implements a two-layer payment governance system:
 
-- `agentShieldAPI.py` is the **gateway** and policy enforcement layer.
-- `agentShieldAgent.py` is the **reasoning brain** that uses LangGraph to iterate on payment attempts.
+- `agentShieldAPI.py`: FastAPI gateway with policy enforcement and orchestration.
+- `agentShieldAgent.py`: LangGraph-based reasoning brain that iterates through spend candidates.
 
-The system is designed so payment requests are evaluated, governed, and only then forwarded to a Stripe/Tempo-style Machine Payment Protocol (MPP) execution adapter.
+The gateway authorizes first, then optionally hands off to an MPP execution adapter.
 
-## What You Have
+## Current Architecture
 
-## 1. Gateway Layer (`agentShieldAPI.py`)
+### Gateway (`agentShieldAPI.py`)
 
-The gateway is a FastAPI service that provides:
+The gateway provides:
 
-- Hard authorization checks (`/v1/authorize-spend`)
-- Ledger visibility (`/v1/ledger/{agent_id}`)
-- End-to-end orchestration (`/v1/process-payment`)
-- MPP execution adapter (`execute_mpp_payment`, mock and real modes)
+- `POST /v1/authorize-spend` for direct policy evaluation.
+- `GET /v1/ledger/{agent_id}` for in-memory spend visibility.
+- `POST /v1/process-payment` for full brain -> gateway -> MPP orchestration.
+- `execute_mpp_payment(...)` adapter with `mock` and `real` modes.
 
-### Core Responsibilities
+Runtime defaults:
 
-- Enforce security gates:
-  - registered agent check
-  - one-time challenge ID (replay protection)
-  - currency policy
-  - ledger integrity check
-- Enforce governance checks in strict order:
-  1. Context alignment
-  2. Velocity and loop detection
-  3. Value assessment
-- Issue a signed payment intent only after all checks pass.
-- Track agent spend and payment events in in-memory ledger structures.
+- Daily cap: `$50.00` (`GatewayConfig.daily_cap_usd`)
+- Multi-currency: disabled (`USD` required)
+- Registered agents: `agent_alpha`, `agent_beta`, `agent_ops`
 
-## 2. Agent Brain Layer (`agentShieldAgent.py`)
+### Agent Brain (`agentShieldAgent.py`)
 
-The brain is a LangGraph loop that performs cyclical reasoning over candidate payment options.
-
-### Graph Nodes
+The brain runs a LangGraph loop with nodes:
 
 - `sync_ledger`
 - `prepare_request`
 - `authorize`
 - `reflect_adjust`
 
-### Loop Behavior
+It can call the gateway:
 
-For each cycle, the brain:
+- Locally (direct function call) when `gateway_url` is `None`
+- Over HTTP when `gateway_url` is set
 
-1. Syncs ledger values.
-2. Builds authorization payload.
-3. Calls the gateway (`authorize_spend`) locally or via HTTP.
-4. If rejected, reads audit + guidance and adapts:
-   - switch vendor candidate
-   - reduce amount for benchmark/cap issues
-   - normalize currency
-   - refresh spend metadata
-5. Retries until:
-   - approved,
-   - max cycles reached, or
-   - no candidates left.
+## Gateway Authorization Logic (Exact Order)
 
-## End-to-End Flow (Current)
+`authorize_spend(...)` evaluates in strict sequence.
 
-1. Client calls `POST /v1/process-payment`.
-2. API instantiates and runs LangGraph brain.
-3. Brain cycles through candidate requests and calls gateway authorization checks.
-4. If authorization fails, process returns rejection with reasoning trail.
-5. If authorization succeeds, API calls `execute_mpp_payment`.
-6. API returns combined result:
-   - `authorization` status/details
-   - `mpp_execution` status/details
-   - final top-level `decision`
+### 1) Security/Policy Pre-Gates
 
-## How Reasoning Works
+1. Agent must be registered.
+2. `mpp_challenge_id` must be unused (replay protection).
+3. Currency must be `USD` unless multi-currency is enabled.
+4. Agent-reported `historical_session_spend` must match gateway ledger (tolerance `0.01`).
 
-The agent does not submit a single blind payment request. It uses a cycle-based reasoning loop in `agentShieldAgent.py`:
+If any pre-gate fails, checks 1-3 are skipped and rejection is returned with guidance.
 
-1. `sync_ledger`
-  - Pulls current session/daily spend from gateway ledger.
-  - Prevents stale metadata from causing false rejects.
+### 2) Check 1: Context Alignment
 
-2. `prepare_request`
-  - Builds a request using the current candidate vendor/amount.
-  - Generates a fresh challenge ID and includes retry metadata.
+- Vendor must pass verification:
+  - HTTPS required
+  - hostname-like netloc required
+  - blocks obvious synthetic markers (`example`, `test`, `fake`, `spoof`, `localhost`, `127.0.0.1`)
+- Task/vendor alignment is rule-based by task keywords.
+- Specific proportionality guard:
+  - task containing `10 listings` with amount `> 50` is rejected.
 
-3. `authorize`
-  - Calls gateway authorization logic.
-  - If approved, loop stops immediately with signed payment intent.
-  - If rejected, moves to reflection.
+### 3) Check 2: Velocity + Loop Detection
 
-4. `reflect_adjust`
-  - Reads `audit_log` and `rejection_guidance`.
-  - Applies strategy updates:
-    - switch candidate if context/vendor mismatch
-    - reduce amount for value/benchmark rejects
-    - reduce amount for velocity/cap pressure
-    - normalize currency if policy requires USD
-    - refresh ledger if mismatch is detected
-  - Retries until approved, max cycles reached, or candidates exhausted.
+- Reject if projected daily total exceeds cap.
+- Loop and velocity flags include:
+  - same-vendor attempts `>= 3` (for non-micro payments)
+  - retry pattern on small charges (`max_retries > 1` and amount `< 1.0`, non-micro)
+  - spend spike over baseline (`> 2.5x` and meaningful absolute volume)
+  - micro-payment flood (`>= 50` events under `$0.10` in last hour)
 
-This is the core "reasoning" behavior: inspect rejection cause, adapt request, and retry in a controlled loop.
+Any flag rejects the request.
 
-## What Must Pass For Approval
+### 4) Check 3: Value Assessment
 
-A payment must pass all of the following in sequence inside `authorize_spend`:
+Service type is inferred from task/vendor text. Benchmarks:
 
-1. Security and policy gates (pre-checks)
-  - Agent ID must be registered.
-  - MPP challenge ID must not be reused.
-  - Currency must match policy (`USD` unless multi-currency enabled).
-  - Agent-reported session spend must match gateway ledger.
+- `data_api`: reject above `$0.50` unless premium justification exists
+- `llm_api`: reject above `$1.00` unless premium justification exists
+- `web_scraping`: reject above `$0.50` unless premium justification exists
+- `email_infra`: reject above `$0.05` unless premium justification exists
+- `research_subscription`: reject above `$50`
+- `unknown`: reject
 
-2. Check 1: Context Alignment
-  - Vendor must be verifiable (HTTPS, plausible identity).
-  - Vendor must logically match task intent.
-  - Requested amount must be proportional for known scope patterns.
+Recurring charges are rejected for owner confirmation before first charge.
 
-3. Check 2: Velocity
-  - Projected daily spend must remain under daily cap.
-  - Retry-loop heuristics must not trigger.
-  - Velocity spike heuristics must not trigger.
-  - Micro-payment flood threshold must not be exceeded.
+Premium justification keywords:
 
-4. Check 3: Value Assessment
-  - Amount must fit benchmark range for inferred service type.
-  - Above-benchmark spend requires contextual premium justification.
-  - Recurring spend is guarded and requires owner confirmation flow.
+- `enterprise`, `sla`, `compliance`, `premium`, `priority`, `real-time`
 
-Only when all checks pass does gateway issue `signed_payment_intent`.
+### 5) Approval Commit
 
-Then `/v1/process-payment` attempts MPP execution:
+Only after all checks pass:
 
-- If MPP execution returns `SUCCEEDED` or `PENDING`, final decision is `APPROVED`.
-- Otherwise final decision is `REJECTED` (authorization may still be approved, but execution failed/skipped).
+- Signed payment intent is created (`HMAC-SHA256` over canonical payload).
+- Challenge ID is marked used.
+- Ledger is updated (`session_spend`, `daily_spend`, `attempts_by_vendor`, `payment_events`).
 
-## API Endpoints
+## Agent Brain Behavior (Current)
 
-## `POST /v1/authorize-spend`
+For each iteration:
 
-Runs direct gateway checks and returns an authorization decision.
+1. `sync_ledger`: pulls ledger from gateway when available.
+2. `prepare_request`: builds authorization payload for current candidate and generates fresh challenge ID.
+3. `authorize`: calls gateway and stops immediately on approval.
+4. `reflect_adjust`: inspects `audit_log` + `rejection_guidance` and applies one strategy.
 
-Request model:
+Reflection strategies implemented:
 
-- `AuthorizeSpendRequest`
-  - `agent_id`
-  - `task_description`
-  - `payment_request`
-    - `amount`
-    - `currency`
-    - `recipient`
-    - `mpp_challenge_id`
-    - `recurring`
-  - `metadata`
-    - `historical_session_spend`
-    - `daily_spend_total`
-    - `priority`
-    - `max_retries`
+- Ledger mismatch guidance: refresh ledger values.
+- Vendor/context mismatch: move to next candidate.
+- Benchmark/high-cost rejection: reduce amount to `60%`.
+- Velocity/cap/loop pressure: reduce amount to `75%`.
+- Currency policy rejection: normalize currency to `USD`.
+- Recurring rejection: move to next candidate.
+- Fallback: move to next candidate.
 
-Response model:
+Stop conditions:
 
-- `AuthorizeSpendResponse`
-  - `decision`: `APPROVED` or `REJECTED`
-  - `auth_token_request`
-  - `signed_payment_intent`
-  - `audit_log`
-  - `rejection_guidance`
+- Approved
+- `max_cycles` reached
+- No candidates left
 
-## `GET /v1/ledger/{agent_id}`
+## End-to-End `/v1/process-payment` Flow
 
-Returns current in-memory ledger totals for a registered agent.
+1. Receive `ProcessPaymentRequest`.
+2. Build `SpendCandidate` list from request candidates.
+3. Run `AgentShieldBrain.run(...)`.
+4. If brain result is not approved:
+  - top-level decision `REJECTED`
+  - MPP status `SKIPPED_NOT_APPROVED`
+5. If approved:
+  - call `execute_mpp_payment(...)`
+  - final decision is:
+    - `APPROVED` when MPP status is `SUCCEEDED` or `PENDING`
+    - `REJECTED` otherwise
 
-## `POST /v1/process-payment`
+## API Models
 
-Runs full orchestration: brain reasoning -> gateway authorization -> MPP adapter.
+### `POST /v1/authorize-spend`
 
-Request model:
+Request: `AuthorizeSpendRequest`
 
-- `ProcessPaymentRequest`
-  - `agent_id`
-  - `task_description`
-  - `candidates`: list of spend options
-  - `session_spend`
-  - `daily_spend`
-  - `brain_max_cycles`
+- `agent_id`
+- `task_description`
+- `payment_request`
+  - `amount`
+  - `currency`
+  - `recipient`
+  - `mpp_challenge_id`
+  - `recurring`
+- `metadata`
+  - `historical_session_spend`
+  - `daily_spend_total`
   - `priority`
-  - `mpp_mode`: `mock` or `real`
+  - `max_retries`
 
-Response model:
+Response: `AuthorizeSpendResponse`
 
-- `ProcessPaymentResponse`
-  - `decision`
-  - `authorization`
-    - includes reasoning log, cycles used, gateway response, signed intent if approved
-  - `mpp_execution`
-    - attempted/status/provider/transaction/message/timestamp
+- `decision`: `APPROVED | REJECTED`
+- `auth_token_request`
+- `signed_payment_intent`
+- `audit_log`
+- `rejection_guidance`
+
+### `GET /v1/ledger/{agent_id}`
+
+Returns:
+
+- `status`
+- `agent_id`
+- `session_spend`
+- `daily_spend`
+- `daily_cap`
+
+### `POST /v1/process-payment`
+
+Request: `ProcessPaymentRequest`
+
+- `agent_id`
+- `task_description`
+- `candidates`
+- `session_spend`
+- `daily_spend`
+- `brain_max_cycles`
+- `priority`
+- `mpp_mode` (`mock` or `real`)
+
+Response: `ProcessPaymentResponse`
+
+- `decision`
+- `authorization`
+  - `approved`
+  - `signed_payment_intent` (when approved)
+  - `cycles_used`
+  - `reasoning_log`
+  - `gateway_response`
+- `mpp_execution`
+  - `attempted`
+  - `status`
+  - `transaction_id`
+  - `provider`
+  - `message`
+  - `executed_at`
 
 ## Running Locally
 
-## Prerequisites
+### Prerequisites
 
 - Python 3.11+
-- Virtual environment with installed packages:
-  - `fastapi`
-  - `uvicorn`
-  - `pydantic`
-  - `langgraph`
+- Installed packages: `fastapi`, `uvicorn`, `pydantic`, `langgraph`
 
-## Start API Server
+### Start API Server
 
 ```bash
-/Users/lucar/Desktop/AgentWallet/.venv/bin/python /Users/lucar/Desktop/AgentWallet/agentShieldAPI.py
+cd /Users/lucar/Desktop/AgentShield
+.venv/bin/python -m uvicorn agentShieldAPI:app --host 0.0.0.0 --port 8000
 ```
 
-Server binds to `http://0.0.0.0:8000`.
-
-## Quick Direct Function Test (No HTTP)
+### Direct Function Test (No HTTP)
 
 ```bash
-/Users/lucar/Desktop/AgentWallet/.venv/bin/python - <<'PY'
+cd /Users/lucar/Desktop/AgentShield
+.venv/bin/python - <<'PY'
 from agentShieldAPI import process_payment, ProcessPaymentRequest
 
 payload = ProcessPaymentRequest(
-    agent_id='agent_alpha',
-    task_description='Scrape 500 real estate listings using a data API',
+    agent_id="agent_alpha",
+    task_description="Scrape 500 real estate listings using a data API",
     candidates=[
         {
-            'description': 'primary',
-            'amount': 0.2,
-            'currency': 'USD',
-            'recipient': 'https://realdataapi.com/v1/listings',
-            'recurring': False,
+            "description": "primary",
+            "amount": 0.2,
+            "currency": "USD",
+            "recipient": "https://realdataapi.com/v1/listings",
+            "recurring": False,
         }
     ],
     session_spend=0.0,
     daily_spend=0.0,
     brain_max_cycles=3,
-    priority='normal',
-    mpp_mode='mock',
+    priority="normal",
+    mpp_mode="mock",
 )
 
 res = process_payment(payload)
@@ -244,7 +249,7 @@ print(res.model_dump_json(indent=2))
 PY
 ```
 
-## HTTP Example (`/v1/process-payment`)
+### HTTP Example
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/process-payment \
@@ -271,57 +276,37 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
 
 ## MPP Adapter Modes
 
-## `mock` (default)
+### `mock`
 
-- Returns successful synthetic execution.
-- Useful for local development and integration tests.
+- Always returns a synthetic `SUCCEEDED` execution.
 
-## `real`
+### `real`
 
-Current real mode is a placeholder with configuration checks.
+- Placeholder path with config checks.
+- Requires:
+  - `TEMPO_MPP_API_KEY`
+  - `TEMPO_MPP_ENDPOINT`
+- If missing, returns `NOT_CONFIGURED`.
+- If present, currently returns placeholder `PENDING` response.
 
-Required environment variables:
+## In-Memory State
 
-- `TEMPO_MPP_API_KEY`
-- `TEMPO_MPP_ENDPOINT`
+State is process-local and resets on restart:
 
-If either variable is missing, the adapter returns `NOT_CONFIGURED`.
+- `ledgers`
+- `used_challenges`
 
-## In-Memory State Notes
-
-The following are in-memory and reset on process restart:
-
-- agent ledger (`ledgers`)
-- used challenge IDs (`used_challenges`)
-
-For production, replace these with durable storage (Redis/Postgres/etc.) and concurrency-safe primitives.
-
-## Security and Governance Characteristics
-
-- One-time challenge IDs reduce replay risk.
-- Ledger mismatch check protects against stale/tampered agent metadata.
-- Daily cap + retry-loop heuristics prevent runaway spend.
-- Benchmark checks discourage overpayment.
-- Recurring purchases are explicitly guarded.
+For production, move these to durable shared storage.
 
 ## Known Limitations
 
-- Vendor verification is heuristic (URL pattern based), not reputation-backed.
-- Real MPP execution is a stub in `real` mode.
-- Ledger and replay set are process-local memory.
-- No auth layer on API endpoints yet.
+- Vendor verification is heuristic (not reputation-backed).
+- Real MPP integration is still a placeholder.
+- No authentication layer on API endpoints.
 - No persistence or cross-instance coordination.
-
-## Suggested Next Steps
-
-1. Add persistent ledger/challenge storage.
-2. Add API authentication/authorization.
-3. Implement live Tempo/Stripe SDK call in `execute_mpp_payment`.
-4. Add structured logging and request IDs.
-5. Add unit/integration tests for each check and graph path.
 
 ## File Overview
 
-- `agentShieldAPI.py`: gateway, policy checks, orchestration endpoint, MPP adapter
-- `agentShieldAgent.py`: LangGraph reasoning brain, cycle adaptation logic
-- `README.md`: this document
+- `agentShieldAPI.py`: gateway checks, endpoints, orchestration, MPP adapter
+- `agentShieldAgent.py`: reasoning brain and adaptation loop
+- `README.md`: project documentation
