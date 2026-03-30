@@ -3,7 +3,7 @@
 This repository implements a two-layer payment governance system:
 
 - `agentShieldAPI.py`: FastAPI gateway with policy enforcement and orchestration.
-- `agentShieldAgent.py`: LangGraph-based reasoning brain that iterates through spend candidates.
+- ` lol.py`: LangGraph-based reasoning brain that iterates through spend candidates.
 
 The gateway authorizes first, then optionally hands off to an MPP execution adapter.
 
