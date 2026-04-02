@@ -239,20 +239,32 @@ class AgentShieldBrain:
             return self._post_json(gateway_url.rstrip("/") + "/v1/request-voucher", payload)
         gateway_module = importlib.import_module("agentShieldAPI")
         request_model = gateway_module.RequestVoucherRequest(**payload)
-        redis_client = gateway_module.redis.from_url(gateway_module.config.redis_url, decode_responses=True)
-        response_model = self._run_async(gateway_module.request_voucher_core(redis_client, request_model))
-        self._run_async(redis_client.aclose())
-        return response_model.model_dump(mode="json")
+
+        async def _run():
+            redis_client = gateway_module.redis.from_url(gateway_module.config.redis_url, decode_responses=True)
+            try:
+                response_model = await gateway_module.request_voucher_core(redis_client, request_model)
+                return response_model.model_dump(mode="json")
+            finally:
+                await redis_client.aclose()
+
+        return self._run_async(_run())
 
     def _call_authorize_spend(self, payload: Dict[str, Any], gateway_url: Optional[str]) -> Dict[str, Any]:
         if gateway_url:
             return self._post_json(gateway_url.rstrip("/") + "/v1/authorize-spend", payload)
         gateway_module = importlib.import_module("agentShieldAPI")
         request_model = gateway_module.AuthorizeSpendRequest(**payload)
-        redis_client = gateway_module.redis.from_url(gateway_module.config.redis_url, decode_responses=True)
-        response_model = self._run_async(gateway_module.authorize_spend_core(redis_client, request_model))
-        self._run_async(redis_client.aclose())
-        return response_model.model_dump(mode="json")
+
+        async def _run():
+            redis_client = gateway_module.redis.from_url(gateway_module.config.redis_url, decode_responses=True)
+            try:
+                response_model = await gateway_module.authorize_spend_core(redis_client, request_model)
+                return response_model.model_dump(mode="json")
+            finally:
+                await redis_client.aclose()
+
+        return self._run_async(_run())
 
     def _post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         req = urllib_request.Request(
@@ -272,7 +284,17 @@ class AgentShieldBrain:
 
     def _run_async(self, awaitable):
         asyncio_module = importlib.import_module("asyncio")
-        return asyncio_module.run(awaitable)
+        try:
+            asyncio_module.get_running_loop()
+        except RuntimeError:
+            return asyncio_module.run(awaitable)
+
+        # We are already inside an active event loop (e.g., FastAPI request handling).
+        # Run the awaitable in a dedicated thread with its own loop.
+        concurrent_futures = importlib.import_module("concurrent.futures")
+        with concurrent_futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(asyncio_module.run, awaitable)
+            return future.result(timeout=20)
 
 
 if __name__ == "__main__":

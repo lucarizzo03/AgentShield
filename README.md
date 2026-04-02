@@ -186,6 +186,9 @@ Behavior:
   - `pydantic`
   - `langgraph`
   - `redis`
+- Tempo CLI installed and logged in (only required for `mpp_mode="real"` recommended path):
+  - `tempo --version`
+  - `tempo wallet login`
 
 ### Start Redis
 
@@ -266,13 +269,23 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
 ## MPP Adapter Modes
 
 - `mock`: returns synthetic `SUCCEEDED`.
-- `real`: sends an HTTP request to provider endpoint; requires:
-  - `TEMPO_MPP_API_KEY`
-  - `TEMPO_MPP_ENDPOINT`
-- Real mode maps approved intent data into provider body and sets:
-  - `Authorization: Bearer <TEMPO_MPP_API_KEY>`
-  - `Idempotency-Key: <mpp_challenge_id>`
-  - `X-AgentShield-Intent-Version: v1`
+- `real` (recommended): executes `tempo request` against the approved `recipient` URL from the signed intent.
+  - Requires an authenticated Tempo CLI session (`tempo wallet login`).
+  - Optional: `TEMPO_USE_CLI=false` disables CLI path.
+  - Optional tuning env vars:
+    - `TEMPO_REQUEST_TIMEOUT_SECONDS` (default `60`)
+    - `TEMPO_REQUEST_CONNECT_TIMEOUT_SECONDS` (default `10`)
+    - `TEMPO_REQUEST_RETRIES` (default `1`)
+    - `TEMPO_REQUEST_RETRY_BACKOFF_MS` (default `400`)
+    - `TEMPO_REQUEST_METHOD` (default `POST`)
+    - `TEMPO_NETWORK` (e.g. `testnet`)
+    - `TEMPO_REQUEST_JSON` (override JSON body for endpoint-specific schemas)
+- `real` fallback (legacy direct POST):
+  - Set `TEMPO_MPP_API_KEY` + `TEMPO_MPP_ENDPOINT` to force direct provider request mode.
+  - Uses headers:
+    - `Authorization: Bearer <TEMPO_MPP_API_KEY>`
+    - `Idempotency-Key: <mpp_challenge_id>`
+    - `X-AgentShield-Intent-Version: v1`
 
 ## Current Limitations
 

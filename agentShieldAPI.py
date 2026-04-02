@@ -10,7 +10,10 @@ import hmac
 import importlib
 import json
 import os
+import re
 import secrets
+import shutil
+import subprocess
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 from typing import Dict, List, Optional
@@ -213,8 +216,6 @@ def execute_mpp_payment_real(
     *,
     signed_payment_intent: str,
     payment_request: Dict[str, object],
-    endpoint: str,
-    api_key: str,
 ) -> MPPExecutionResult:
     now = utc_now_iso()
     approved_intent = verify_and_unpack_signed_intent(signed_payment_intent)
@@ -225,6 +226,137 @@ def execute_mpp_payment_real(
             transaction_id=None,
             provider="tempo-mpp",
             message="signed_payment_intent failed verification.",
+            executed_at=now,
+        )
+
+    recipient_url = str(approved_intent.get("vendor_url", "")).strip()
+    if not recipient_url:
+        return MPPExecutionResult(
+            attempted=False,
+            status="INVALID_RECIPIENT",
+            transaction_id=None,
+            provider="tempo-mpp",
+            message="Signed intent does not contain a recipient vendor URL.",
+            executed_at=now,
+        )
+
+    # Preferred path: use authenticated tempo wallet session against recipient.
+    use_tempo_cli = os.getenv("TEMPO_USE_CLI", "true").strip().lower() in {"1", "true", "yes"}
+    if use_tempo_cli and shutil.which("tempo"):
+        timeout_seconds = max(5, int(os.getenv("TEMPO_REQUEST_TIMEOUT_SECONDS", "60")))
+        connect_timeout_seconds = max(2, int(os.getenv("TEMPO_REQUEST_CONNECT_TIMEOUT_SECONDS", "10")))
+        retries = max(0, int(os.getenv("TEMPO_REQUEST_RETRIES", "1")))
+        retry_backoff_ms = max(50, int(os.getenv("TEMPO_REQUEST_RETRY_BACKOFF_MS", "400")))
+        method = os.getenv("TEMPO_REQUEST_METHOD", "POST").strip().upper() or "POST"
+        network = os.getenv("TEMPO_NETWORK", "").strip()
+        max_spend = max(1, int(approved_intent.get("amount_cents", 1))) / 100.0
+
+        vendor_payload: Dict[str, object] = {
+            # Many generative endpoints expect a prompt; task text is the safest default.
+            "prompt": str(payment_request.get("task_description", "")),
+            "agent_id": approved_intent.get("agent_id"),
+            "amount_cents": approved_intent.get("amount_cents"),
+            "currency": approved_intent.get("currency"),
+        }
+        custom_json = os.getenv("TEMPO_REQUEST_JSON", "").strip()
+        if custom_json:
+            try:
+                parsed = json.loads(custom_json)
+                if isinstance(parsed, dict):
+                    vendor_payload = parsed
+            except Exception:
+                pass
+
+        cmd = [
+            "tempo",
+            "request",
+            "--json-output",
+            "--silent",
+            "--max-spend",
+            f"{max_spend:.2f}",
+            "--timeout",
+            str(timeout_seconds),
+            "--connect-timeout",
+            str(connect_timeout_seconds),
+            "--retries",
+            str(retries),
+            "--retry-backoff",
+            str(retry_backoff_ms),
+            "-X",
+            method,
+            "--json",
+            json.dumps(vendor_payload),
+            recipient_url,
+        ]
+        if network:
+            cmd.extend(["--network", network])
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds + 10)
+            if proc.returncode == 0:
+                output = (proc.stdout or "").strip()
+                parsed = {}
+                if output.startswith("{") and output.endswith("}"):
+                    try:
+                        parsed = json.loads(output)
+                    except Exception:
+                        parsed = {}
+                tx_id = parsed.get("transaction_id") or parsed.get("id")
+                if not tx_id:
+                    match = re.search(r"(tx_[A-Za-z0-9_-]+|mpp_[A-Za-z0-9_-]+)", output)
+                    tx_id = match.group(1) if match else None
+                return MPPExecutionResult(
+                    attempted=True,
+                    status="SUCCEEDED",
+                    transaction_id=str(tx_id) if tx_id else None,
+                    provider="tempo-cli",
+                    message=(
+                        "Payment executed via tempo request "
+                        f"(timeout={timeout_seconds}s retries={retries})."
+                    ),
+                    executed_at=utc_now_iso(),
+                )
+
+            stderr = (proc.stderr or "").strip()
+            stdout = (proc.stdout or "").strip()
+            return MPPExecutionResult(
+                attempted=True,
+                status="PROVIDER_HTTP_ERROR",
+                transaction_id=None,
+                provider="tempo-cli",
+                message=(
+                    "tempo request failed: "
+                    f"{stderr or 'non-zero exit without stderr'}"
+                    + (f" | stdout={stdout[:400]}" if stdout else "")
+                ),
+                executed_at=utc_now_iso(),
+            )
+        except subprocess.TimeoutExpired:
+            return MPPExecutionResult(
+                attempted=True,
+                status="PROVIDER_TIMEOUT",
+                transaction_id=None,
+                provider="tempo-cli",
+                message=(
+                    "tempo request timed out at wrapper level "
+                    "(increase TEMPO_REQUEST_TIMEOUT_SECONDS and/or ensure endpoint responsiveness)."
+                ),
+                executed_at=utc_now_iso(),
+            )
+
+    # Legacy direct provider fallback.
+    endpoint = os.getenv("TEMPO_MPP_ENDPOINT", "").strip()
+    api_key = os.getenv("TEMPO_MPP_API_KEY", "").strip()
+    if not endpoint or not api_key:
+        return MPPExecutionResult(
+            attempted=False,
+            status="NOT_CONFIGURED",
+            transaction_id=None,
+            provider="tempo-mpp",
+            message=(
+                "Real mode requires tempo CLI login (recommended), or "
+                "TEMPO_MPP_ENDPOINT + TEMPO_MPP_API_KEY for direct provider POST."
+            ),
             executed_at=now,
         )
 
@@ -324,22 +456,9 @@ def execute_mpp_payment(
         )
 
     if mode.lower() == "real":
-        api_key = os.getenv("TEMPO_MPP_API_KEY")
-        endpoint = os.getenv("TEMPO_MPP_ENDPOINT")
-        if not api_key or not endpoint:
-            return MPPExecutionResult(
-                attempted=False,
-                status="NOT_CONFIGURED",
-                transaction_id=None,
-                provider="tempo-mpp",
-                message="Real MPP mode selected but TEMPO_MPP_API_KEY or TEMPO_MPP_ENDPOINT is missing.",
-                executed_at=now,
-            )
         return execute_mpp_payment_real(
             signed_payment_intent=signed_payment_intent,
             payment_request=payment_request,
-            endpoint=endpoint,
-            api_key=api_key,
         )
 
     return MPPExecutionResult(
