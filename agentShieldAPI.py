@@ -4,12 +4,15 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import base64
 import hashlib
 import hmac
 import importlib
 import json
 import os
 import secrets
+from urllib import request as urllib_request
+from urllib.error import HTTPError, URLError
 from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -178,8 +181,128 @@ def normalize_vendor(recipient: str) -> str:
 
 def build_signed_intent(payload: Dict[str, object]) -> str:
     packed = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    digest = hmac.new(config.signing_secret.encode("utf-8"), packed, hashlib.sha256).hexdigest()
-    return f"mpp_sig_{digest}"
+    signature = hmac.new(config.signing_secret.encode("utf-8"), packed, hashlib.sha256).hexdigest()
+    payload_b64 = base64.urlsafe_b64encode(packed).decode("ascii").rstrip("=")
+    return f"mpp_intent_v1.{payload_b64}.{signature}"
+
+
+def verify_and_unpack_signed_intent(signed_payment_intent: str) -> Optional[Dict[str, object]]:
+    parts = signed_payment_intent.split(".")
+    if len(parts) != 3 or parts[0] != "mpp_intent_v1":
+        return None
+
+    payload_b64, provided_sig = parts[1], parts[2]
+    padding = "=" * (-len(payload_b64) % 4)
+    try:
+        packed = base64.urlsafe_b64decode((payload_b64 + padding).encode("ascii"))
+    except Exception:
+        return None
+
+    expected_sig = hmac.new(config.signing_secret.encode("utf-8"), packed, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_sig, provided_sig):
+        return None
+
+    try:
+        unpacked = json.loads(packed.decode("utf-8"))
+    except Exception:
+        return None
+    return unpacked if isinstance(unpacked, dict) else None
+
+
+def execute_mpp_payment_real(
+    *,
+    signed_payment_intent: str,
+    payment_request: Dict[str, object],
+    endpoint: str,
+    api_key: str,
+) -> MPPExecutionResult:
+    now = utc_now_iso()
+    approved_intent = verify_and_unpack_signed_intent(signed_payment_intent)
+    if not approved_intent:
+        return MPPExecutionResult(
+            attempted=False,
+            status="INVALID_INTENT",
+            transaction_id=None,
+            provider="tempo-mpp",
+            message="signed_payment_intent failed verification.",
+            executed_at=now,
+        )
+
+    mpp_body = {
+        "authorization": {
+            "intent_token": signed_payment_intent,
+            "approved_at": approved_intent.get("timestamp"),
+        },
+        "payment": {
+            "agent_id": approved_intent.get("agent_id"),
+            "vendor_url": approved_intent.get("vendor_url"),
+            "currency": approved_intent.get("currency"),
+            "amount_cents": approved_intent.get("amount_cents"),
+            "mpp_challenge_id": approved_intent.get("mpp_challenge_id"),
+        },
+        "context": {
+            "task_description": payment_request.get("task_description", ""),
+            "gateway_version": "agent-shield-2.0.0",
+            "requested_at": now,
+        },
+    }
+
+    challenge_id = str(approved_intent.get("mpp_challenge_id", ""))
+    request_obj = urllib_request.Request(
+        endpoint,
+        data=json.dumps(mpp_body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Idempotency-Key": challenge_id or f"idem_{secrets.token_hex(8)}",
+            "X-AgentShield-Intent-Version": "v1",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib_request.urlopen(request_obj, timeout=15) as resp:
+            raw_body = resp.read().decode("utf-8")
+            parsed = json.loads(raw_body) if raw_body else {}
+            provider_status = str(parsed.get("status", "SUCCEEDED")).upper()
+            tx_id = parsed.get("transaction_id") or parsed.get("id")
+            mapped_status = "SUCCEEDED" if provider_status in {"SUCCEEDED", "APPROVED", "COMPLETED"} else provider_status
+            return MPPExecutionResult(
+                attempted=True,
+                status=mapped_status,
+                transaction_id=str(tx_id) if tx_id else None,
+                provider="tempo-mpp",
+                message="Real MPP execution request accepted by provider.",
+                executed_at=utc_now_iso(),
+            )
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8") if exc.fp else ""
+        return MPPExecutionResult(
+            attempted=True,
+            status="PROVIDER_HTTP_ERROR",
+            transaction_id=None,
+            provider="tempo-mpp",
+            message=f"Provider returned HTTP {exc.code}: {body or 'no response body'}",
+            executed_at=utc_now_iso(),
+        )
+    except URLError as exc:
+        return MPPExecutionResult(
+            attempted=True,
+            status="PROVIDER_NETWORK_ERROR",
+            transaction_id=None,
+            provider="tempo-mpp",
+            message=f"Provider network error: {exc}",
+            executed_at=utc_now_iso(),
+        )
+    except Exception as exc:
+        return MPPExecutionResult(
+            attempted=True,
+            status="PROVIDER_PARSE_ERROR",
+            transaction_id=None,
+            provider="tempo-mpp",
+            message=f"Unexpected provider response handling error: {exc}",
+            executed_at=utc_now_iso(),
+        )
 
 
 def execute_mpp_payment(
@@ -212,14 +335,11 @@ def execute_mpp_payment(
                 message="Real MPP mode selected but TEMPO_MPP_API_KEY or TEMPO_MPP_ENDPOINT is missing.",
                 executed_at=now,
             )
-
-        return MPPExecutionResult(
-            attempted=True,
-            status="PENDING",
-            transaction_id=f"mpp_real_{secrets.token_hex(8)}",
-            provider="tempo-mpp",
-            message="Real MPP adapter configured; replace placeholder with live provider SDK/API call.",
-            executed_at=now,
+        return execute_mpp_payment_real(
+            signed_payment_intent=signed_payment_intent,
+            payment_request=payment_request,
+            endpoint=endpoint,
+            api_key=api_key,
         )
 
     return MPPExecutionResult(

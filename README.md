@@ -105,6 +105,12 @@ Response fields:
 - `voucher_remaining_cents`
 - `rejection_guidance` (nullable)
 
+Signed intent format:
+
+- `mpp_intent_v1.<base64url(payload_json)>.<hmac_sha256_signature>`
+- Payload contains: `agent_id`, `vendor_url`, `currency`, `session_token`, `mpp_challenge_id`, `amount_cents`, `timestamp`
+- Signature is verified before real MPP execution.
+
 ---
 
 ### `GET /v1/ledger/{agent_id}`
@@ -260,9 +266,13 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
 ## MPP Adapter Modes
 
 - `mock`: returns synthetic `SUCCEEDED`.
-- `real`: placeholder mode; requires:
+- `real`: sends an HTTP request to provider endpoint; requires:
   - `TEMPO_MPP_API_KEY`
   - `TEMPO_MPP_ENDPOINT`
+- Real mode maps approved intent data into provider body and sets:
+  - `Authorization: Bearer <TEMPO_MPP_API_KEY>`
+  - `Idempotency-Key: <mpp_challenge_id>`
+  - `X-AgentShield-Intent-Version: v1`
 
 ## Current Limitations
 
