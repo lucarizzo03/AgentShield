@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import importlib
 import json
+import math
 import os
 import re
 import secrets
@@ -68,6 +69,18 @@ class AuthorizeSpendResponse(BaseModel):
     decision: Decision
     signed_payment_intent: Optional[str]
     voucher_remaining_cents: int
+    rejection_guidance: Optional[str]
+
+
+class ReleaseVoucherRequest(BaseModel):
+    session_token: str
+    reason: str = "execution_failed_or_completed"
+
+
+class ReleaseVoucherResponse(BaseModel):
+    decision: Decision
+    released_budget_cents: int
+    daily_budget_remaining_cents: int
     rejection_guidance: Optional[str]
 
 
@@ -180,6 +193,41 @@ def challenge_key(mpp_challenge_id: str) -> str:
 
 def normalize_vendor(recipient: str) -> str:
     return recipient.strip().lower()
+
+
+def _fx_rates_to_usd() -> Dict[str, float]:
+    raw = os.getenv("FX_RATES_TO_USD_JSON", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                rates: Dict[str, float] = {"USD": 1.0}
+                for k, v in parsed.items():
+                    try:
+                        rates[str(k).upper()] = float(v)
+                    except Exception:
+                        continue
+                return rates
+        except Exception:
+            pass
+    # Conservative defaults for local/dev only.
+    return {
+        "USD": 1.0,
+        "EUR": 1.08,
+        "GBP": 1.26,
+        "CAD": 0.74,
+        "AUD": 0.66,
+        "JPY": 0.0067,
+    }
+
+
+def convert_to_usd_budget_cents(amount_cents: int, currency: str) -> int:
+    rates = _fx_rates_to_usd()
+    fx = rates.get(currency.upper())
+    if fx is None:
+        raise ValueError(f"Unsupported currency for budget conversion: {currency}")
+    # Round up to avoid under-reserving budget.
+    return max(1, int(math.ceil(float(amount_cents) * fx)))
 
 
 def build_signed_intent(payload: Dict[str, object]) -> str:
@@ -471,6 +519,199 @@ def execute_mpp_payment(
     )
 
 
+def _build_vendor_request(
+    *,
+    url: str,
+    task_description: str,
+    signed_payment_intent: Optional[str] = None,
+) -> urllib_request.Request:
+    method = os.getenv("TEMPO_REQUEST_METHOD", "POST").strip().upper() or "POST"
+    custom_json = os.getenv("TEMPO_REQUEST_JSON", "").strip()
+    payload = {"prompt": task_description} if not custom_json else {}
+    if custom_json:
+        try:
+            parsed = json.loads(custom_json)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception:
+            payload = {"prompt": task_description}
+
+    data = None
+    headers = {"Content-Type": "application/json"}
+    if method in {"POST", "PUT", "PATCH"}:
+        data = json.dumps(payload).encode("utf-8")
+    if signed_payment_intent:
+        headers["Authorization"] = f"Bearer {signed_payment_intent}"
+        headers["X-MPP-Payment-Intent"] = signed_payment_intent
+    return urllib_request.Request(url, data=data, headers=headers, method=method)
+
+
+def _extract_402_details(exc: HTTPError) -> Dict[str, object]:
+    raw_body = exc.read().decode("utf-8") if exc.fp else ""
+    body: Dict[str, object] = {}
+    if raw_body:
+        try:
+            parsed = json.loads(raw_body)
+            if isinstance(parsed, dict):
+                body = parsed
+        except Exception:
+            body = {}
+
+    headers = {k.lower(): v for k, v in dict(exc.headers.items()).items()} if exc.headers else {}
+    challenge_id = (
+        headers.get("x-mpp-challenge-id")
+        or headers.get("mpp-challenge-id")
+        or body.get("mpp_challenge_id")
+        or body.get("challenge_id")
+    )
+    amount_cents = (
+        headers.get("x-mpp-amount-cents")
+        or headers.get("mpp-amount-cents")
+        or body.get("amount_cents")
+        or body.get("required_amount_cents")
+    )
+    currency = (
+        headers.get("x-mpp-currency")
+        or headers.get("mpp-currency")
+        or body.get("currency")
+        or "USD"
+    )
+    out: Dict[str, object] = {
+        "challenge_id": str(challenge_id) if challenge_id else "",
+        "currency": str(currency),
+        "raw_body": raw_body,
+    }
+    try:
+        out["amount_cents"] = int(amount_cents) if amount_cents is not None else None
+    except Exception:
+        out["amount_cents"] = None
+    return out
+
+
+async def execute_mpp_402_handshake(
+    *,
+    redis_client: redis.Redis,
+    session_token: str,
+    candidate: Dict[str, object],
+    task_description: str,
+) -> MPPExecutionResult:
+    now = utc_now_iso()
+    vendor_url = str(candidate.get("recipient", "")).strip()
+    fallback_amount = int(candidate.get("amount_cents", 0) or 0)
+    if not vendor_url:
+        return MPPExecutionResult(
+            attempted=False,
+            status="INVALID_RECIPIENT",
+            transaction_id=None,
+            provider="tempo-mpp",
+            message="Missing vendor recipient URL.",
+            executed_at=now,
+        )
+
+    # Step 1: provoke vendor to issue 402 challenge.
+    initial_req = _build_vendor_request(url=vendor_url, task_description=task_description, signed_payment_intent=None)
+    try:
+        # Some endpoints can return 200 without payment challenge.
+        with urllib_request.urlopen(initial_req, timeout=20):
+            return MPPExecutionResult(
+                attempted=True,
+                status="SUCCEEDED",
+                transaction_id=None,
+                provider="tempo-mpp-http",
+                message="Vendor request succeeded without 402 challenge.",
+                executed_at=utc_now_iso(),
+            )
+    except HTTPError as exc:
+        if exc.code != 402:
+            body = exc.read().decode("utf-8") if exc.fp else ""
+            return MPPExecutionResult(
+                attempted=True,
+                status="PROVIDER_HTTP_ERROR",
+                transaction_id=None,
+                provider="tempo-mpp-http",
+                message=f"Vendor returned HTTP {exc.code} before challenge authorization: {body or 'no body'}",
+                executed_at=utc_now_iso(),
+            )
+        challenge = _extract_402_details(exc)
+    except URLError as exc:
+        return MPPExecutionResult(
+            attempted=True,
+            status="PROVIDER_NETWORK_ERROR",
+            transaction_id=None,
+            provider="tempo-mpp-http",
+            message=f"Vendor network error during challenge probe: {exc}",
+            executed_at=utc_now_iso(),
+        )
+
+    challenge_id = str(challenge.get("challenge_id", "")).strip()
+    if not challenge_id:
+        return MPPExecutionResult(
+            attempted=True,
+            status="CHALLENGE_PARSE_ERROR",
+            transaction_id=None,
+            provider="tempo-mpp-http",
+            message=f"Vendor returned 402 but no parseable challenge ID. Body: {challenge.get('raw_body', '')}",
+            executed_at=utc_now_iso(),
+        )
+
+    amount_cents = challenge.get("amount_cents")
+    authorize_amount = int(amount_cents) if amount_cents is not None else max(1, fallback_amount)
+    auth_response = await authorize_spend_core(
+        redis_client,
+        AuthorizeSpendRequest(
+            session_token=session_token,
+            mpp_challenge_id=challenge_id,
+            amount_cents=authorize_amount,
+        ),
+    )
+    if auth_response.decision != Decision.APPROVED or not auth_response.signed_payment_intent:
+        return MPPExecutionResult(
+            attempted=True,
+            status="AUTHORIZATION_REJECTED",
+            transaction_id=None,
+            provider="tempo-mpp-http",
+            message=f"Gateway rejected challenge authorization: {auth_response.rejection_guidance or 'no guidance'}",
+            executed_at=utc_now_iso(),
+        )
+
+    # Step 2: retry vendor request with payment intent attached.
+    retry_req = _build_vendor_request(
+        url=vendor_url,
+        task_description=task_description,
+        signed_payment_intent=auth_response.signed_payment_intent,
+    )
+    try:
+        with urllib_request.urlopen(retry_req, timeout=20) as resp:
+            tx_id = resp.headers.get("x-mpp-transaction-id") or resp.headers.get("x-transaction-id")
+            return MPPExecutionResult(
+                attempted=True,
+                status="SUCCEEDED",
+                transaction_id=tx_id,
+                provider="tempo-mpp-http",
+                message="402 challenge authorized and vendor request succeeded on retry.",
+                executed_at=utc_now_iso(),
+            )
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8") if exc.fp else ""
+        return MPPExecutionResult(
+            attempted=True,
+            status="PROVIDER_HTTP_ERROR",
+            transaction_id=None,
+            provider="tempo-mpp-http",
+            message=f"Vendor rejected retry after authorization (HTTP {exc.code}): {body or 'no body'}",
+            executed_at=utc_now_iso(),
+        )
+    except URLError as exc:
+        return MPPExecutionResult(
+            attempted=True,
+            status="PROVIDER_NETWORK_ERROR",
+            transaction_id=None,
+            provider="tempo-mpp-http",
+            message=f"Vendor network error on authorized retry: {exc}",
+            executed_at=utc_now_iso(),
+        )
+
+
 async def request_voucher_core(r: redis.Redis, payload: RequestVoucherRequest) -> RequestVoucherResponse:
     if payload.agent_id not in registered_agents:
         return RequestVoucherResponse(
@@ -482,12 +723,23 @@ async def request_voucher_core(r: redis.Redis, payload: RequestVoucherRequest) -
         )
 
     daily_key = daily_budget_key(payload.agent_id)
+    try:
+        reserve_budget_cents = convert_to_usd_budget_cents(payload.requested_amount_cents, payload.currency)
+    except ValueError as exc:
+        return RequestVoucherResponse(
+            decision=Decision.REJECTED,
+            session_token=None,
+            voucher_remaining_cents=0,
+            daily_budget_remaining_cents=0,
+            rejection_guidance=str(exc),
+        )
+
     reserve = await r.eval(
         RESERVE_DAILY_BUDGET_LUA,
         1,
         daily_key,
         config.daily_cap_cents,
-        payload.requested_amount_cents,
+        reserve_budget_cents,
     )
 
     if int(reserve) < 0:
@@ -515,6 +767,9 @@ async def request_voucher_core(r: redis.Redis, payload: RequestVoucherRequest) -
                 "vendor_url": vendor,
                 "currency": payload.currency.upper(),
                 "created_at": utc_now_iso(),
+                "requested_amount_cents": str(payload.requested_amount_cents),
+                "reserved_budget_cents": str(reserve_budget_cents),
+                "budget_day_key": daily_key,
             },
         )
         pipe.expire(meta_key, config.voucher_ttl_seconds)
@@ -585,6 +840,47 @@ async def authorize_spend_core(r: redis.Redis, payload: AuthorizeSpendRequest) -
     )
 
 
+async def release_voucher_core(r: redis.Redis, payload: ReleaseVoucherRequest) -> ReleaseVoucherResponse:
+    balance_key = voucher_balance_key(payload.session_token)
+    meta_key = voucher_meta_key(payload.session_token)
+    meta = await r.hgetall(meta_key)
+    if not meta:
+        return ReleaseVoucherResponse(
+            decision=Decision.REJECTED,
+            released_budget_cents=0,
+            daily_budget_remaining_cents=0,
+            rejection_guidance="Voucher metadata not found (already released or expired).",
+        )
+
+    balance_raw = await r.get(balance_key)
+    remaining_voucher_cents = int(balance_raw) if balance_raw is not None else 0
+    requested_amount = int(meta.get("requested_amount_cents", "0") or 0)
+    reserved_budget = int(meta.get("reserved_budget_cents", "0") or 0)
+    budget_day = meta.get("budget_day_key") or daily_budget_key(str(meta.get("agent_id", "")))
+
+    released_budget_cents = 0
+    if requested_amount > 0 and reserved_budget > 0 and remaining_voucher_cents > 0:
+        # Return proportional remaining budget reservation back to daily pool.
+        released_budget_cents = int((remaining_voucher_cents * reserved_budget) / requested_amount)
+        released_budget_cents = max(0, min(reserved_budget, released_budget_cents))
+
+    async with r.pipeline() as pipe:
+        if released_budget_cents > 0:
+            pipe.incrby(budget_day, released_budget_cents)
+        pipe.delete(balance_key)
+        pipe.delete(meta_key)
+        await pipe.execute()
+
+    current_budget = await r.get(budget_day)
+    remaining_daily = int(current_budget) if current_budget is not None else config.daily_cap_cents
+    return ReleaseVoucherResponse(
+        decision=Decision.APPROVED,
+        released_budget_cents=released_budget_cents,
+        daily_budget_remaining_cents=remaining_daily,
+        rejection_guidance=None,
+    )
+
+
 @app.post("/v1/request-voucher", response_model=RequestVoucherResponse)
 async def request_voucher(payload: RequestVoucherRequest, request: Request) -> RequestVoucherResponse:
     r = request.app.state.redis
@@ -595,6 +891,12 @@ async def request_voucher(payload: RequestVoucherRequest, request: Request) -> R
 async def authorize_spend(payload: AuthorizeSpendRequest, request: Request) -> AuthorizeSpendResponse:
     r = request.app.state.redis
     return await authorize_spend_core(r, payload)
+
+
+@app.post("/v1/release-voucher", response_model=ReleaseVoucherResponse)
+async def release_voucher(payload: ReleaseVoucherRequest, request: Request) -> ReleaseVoucherResponse:
+    r = request.app.state.redis
+    return await release_voucher_core(r, payload)
 
 
 @app.get("/v1/ledger/{agent_id}")
@@ -617,9 +919,9 @@ async def get_agent_ledger(agent_id: str, request: Request) -> Dict[str, int | s
 
 
 @app.post("/v1/process-payment", response_model=ProcessPaymentResponse)
-async def process_payment(payload: ProcessPaymentRequest) -> ProcessPaymentResponse:
+async def process_payment(payload: ProcessPaymentRequest, request: Request) -> ProcessPaymentResponse:
     brain_module = importlib.import_module("agentShieldAgent")
-    spend_candidates = [
+    all_candidates = [
         brain_module.SpendCandidate(
             description=c.description,
             amount_cents=c.amount_cents,
@@ -629,62 +931,142 @@ async def process_payment(payload: ProcessPaymentRequest) -> ProcessPaymentRespo
         )
         for c in payload.candidates
     ]
-    brain = brain_module.AgentShieldBrain(
-        brain_module.AgentBrainConfig(
-            max_cycles=max(1, int(payload.brain_max_cycles)),
-            gateway_url=None,
-            priority=payload.priority,
+    remaining_candidates = list(all_candidates)
+    aggregate_log: List[str] = []
+    last_mpp_result = MPPExecutionResult(
+        attempted=False,
+        status="SKIPPED_NOT_APPROVED",
+        transaction_id=None,
+        provider="tempo-mpp",
+        message="No candidates executed.",
+        executed_at=utc_now_iso(),
+    )
+    last_auth: Dict[str, object] = {"approved": False}
+    max_cycles = max(1, int(payload.brain_max_cycles))
+
+    for cycle in range(max_cycles):
+        if not remaining_candidates:
+            break
+
+        brain = brain_module.AgentShieldBrain(
+            brain_module.AgentBrainConfig(
+                max_cycles=1,
+                gateway_url=None,
+                priority=payload.priority,
+            )
         )
-    )
+        brain_result = brain.run(
+            agent_id=payload.agent_id,
+            task_description=payload.task_description,
+            candidates=remaining_candidates,
+        )
+        aggregate_log.extend(brain_result.get("reasoning_log", []))
 
-    brain_result = brain.run(
-        agent_id=payload.agent_id,
-        task_description=payload.task_description,
-        candidates=spend_candidates,
-    )
+        voucher_ok = bool(brain_result.get("approved"))
+        voucher_response = brain_result.get("voucher_response") or {}
+        selected_candidate = brain_result.get("selected_candidate") or {}
+        session_token = str(voucher_response.get("session_token") or "")
 
-    approved = bool(brain_result.get("approved"))
-    gateway_response = brain_result.get("gateway_response") or {}
-    if not approved:
-        return ProcessPaymentResponse(
-            decision="REJECTED",
-            authorization={
+        if not voucher_ok or not session_token:
+            last_auth = {
                 "approved": False,
-                "cycles_used": brain_result.get("cycles_used"),
-                "reasoning_log": brain_result.get("reasoning_log"),
-                "gateway_response": gateway_response,
-            },
-            mpp_execution=MPPExecutionResult(
+                "cycle": cycle + 1,
+                "gateway_response": voucher_response,
+                "selected_candidate": selected_candidate,
+            }
+            last_mpp_result = MPPExecutionResult(
                 attempted=False,
                 status="SKIPPED_NOT_APPROVED",
                 transaction_id=None,
                 provider="tempo-mpp",
-                message="Authorization rejected; payment not forwarded to MPP rail.",
+                message="Voucher reservation rejected; execution not started.",
                 executed_at=utc_now_iso(),
-            ),
+            )
+            break
+
+        if payload.mpp_mode.lower() == "real":
+            mpp_result = await execute_mpp_402_handshake(
+                redis_client=request.app.state.redis,
+                session_token=session_token,
+                candidate=selected_candidate,
+                task_description=payload.task_description,
+            )
+        else:
+            signed_intent = build_signed_intent(
+                {
+                    "agent_id": payload.agent_id,
+                    "vendor_url": selected_candidate.get("recipient", ""),
+                    "currency": selected_candidate.get("currency", "USD"),
+                    "session_token": session_token,
+                    "mpp_challenge_id": f"mock_{secrets.token_hex(6)}",
+                    "amount_cents": int(selected_candidate.get("amount_cents", 1)),
+                    "timestamp": utc_now_iso(),
+                }
+            )
+            mpp_result = execute_mpp_payment(
+                signed_payment_intent=signed_intent,
+                payment_request={
+                    "agent_id": payload.agent_id,
+                    "task_description": payload.task_description,
+                    "gateway_response": voucher_response,
+                },
+                mode=payload.mpp_mode,
+            )
+
+        release_response = await release_voucher_core(
+            request.app.state.redis,
+            ReleaseVoucherRequest(session_token=session_token, reason="execution_cycle_end"),
+        )
+        aggregate_log.append(
+            f"Released voucher after cycle {cycle + 1}: refunded {release_response.released_budget_cents} budget cents."
         )
 
-    signed_intent = str(brain_result.get("signed_payment_intent") or "")
-    mpp_result = execute_mpp_payment(
-        signed_payment_intent=signed_intent,
-        payment_request={
-            "agent_id": payload.agent_id,
-            "task_description": payload.task_description,
-            "gateway_response": gateway_response,
-        },
-        mode=payload.mpp_mode,
-    )
-    final_decision = "APPROVED" if mpp_result.status in {"SUCCEEDED", "PENDING"} else "REJECTED"
-    return ProcessPaymentResponse(
-        decision=final_decision,
-        authorization={
+        last_auth = {
             "approved": True,
-            "signed_payment_intent": signed_intent,
-            "cycles_used": brain_result.get("cycles_used"),
-            "reasoning_log": brain_result.get("reasoning_log"),
-            "gateway_response": gateway_response,
+            "cycle": cycle + 1,
+            "session_token": session_token,
+            "gateway_response": voucher_response,
+            "selected_candidate": selected_candidate,
+            "release_voucher": release_response.model_dump(mode="json"),
+        }
+        last_mpp_result = mpp_result
+
+        if mpp_result.status in {"SUCCEEDED", "PENDING"}:
+            return ProcessPaymentResponse(
+                decision="APPROVED",
+                authorization={
+                    **last_auth,
+                    "cycles_used": cycle,
+                    "reasoning_log": aggregate_log,
+                },
+                mpp_execution=mpp_result,
+            )
+
+        # Execution failed -> remove current candidate and continue.
+        next_candidates = []
+        removed = False
+        for cand in remaining_candidates:
+            same = (
+                cand.recipient == selected_candidate.get("recipient")
+                and cand.amount_cents == int(selected_candidate.get("amount_cents", -1))
+                and cand.currency == selected_candidate.get("currency")
+                and cand.description == selected_candidate.get("description")
+            )
+            if same and not removed:
+                removed = True
+                continue
+            next_candidates.append(cand)
+        remaining_candidates = next_candidates
+        aggregate_log.append(f"Execution failed at cycle {cycle + 1}; moving to next candidate.")
+
+    return ProcessPaymentResponse(
+        decision="REJECTED",
+        authorization={
+            **last_auth,
+            "cycles_used": min(max_cycles, len(all_candidates)),
+            "reasoning_log": aggregate_log,
         },
-        mpp_execution=mpp_result,
+        mpp_execution=last_mpp_result,
     )
 
 

@@ -17,8 +17,8 @@ The Gateway decides *whether spending is allowed right now*.
 |                                                              |
 | 1) Select next candidate                                     |
 | 2) POST /v1/request-voucher                                  |
-| 3) POST /v1/authorize-spend                                  |
-| 4) If rejected, mark candidate FAILED and try next vendor    |
+| 3) Hand session token to executor                            |
+| 4) If execution fails, try next vendor                       |
 +-------------------------------+------------------------------+
                                 |
                                 | HTTP or local call
@@ -67,9 +67,10 @@ Request:
 Behavior:
 
 1. Validates `agent_id` is registered.
-2. Reserves from the agent daily budget in Redis.
-3. Creates voucher keys with TTL.
-4. Returns a `session_token`.
+2. Converts requested currency into base USD cents for budget accounting.
+3. Reserves from the agent daily budget in Redis.
+4. Creates voucher keys with TTL.
+5. Returns a `session_token`.
 
 Response fields:
 
@@ -113,6 +114,31 @@ Signed intent format:
 
 ---
 
+### `POST /v1/release-voucher`
+
+Releases unused voucher value back into the daily budget reservation pool.
+
+Request:
+
+- `session_token` (string)
+- `reason` (string, optional)
+
+Behavior:
+
+1. Reads voucher metadata and remaining voucher cents.
+2. Computes proportional remaining reserved budget in base currency (USD cents).
+3. Credits that amount back to the original daily budget key.
+4. Deletes voucher keys so the session cannot be reused.
+
+Response fields:
+
+- `decision`
+- `released_budget_cents`
+- `daily_budget_remaining_cents`
+- `rejection_guidance` (nullable)
+
+---
+
 ### `GET /v1/ledger/{agent_id}`
 
 Daily budget visibility for dashboard/ops.
@@ -132,8 +158,10 @@ Returns:
 Convenience orchestration endpoint:
 
 1. Runs the Brain candidate loop.
-2. Uses voucher + authorize gateway flow.
-3. If approved, runs MPP adapter (`mock` or `real`).
+2. Reserves voucher for a selected candidate.
+3. Executor performs HTTP 402 handshake (probe -> challenge -> authorize -> retry).
+4. Releases voucher residue (`/v1/release-voucher`) after each execution attempt.
+5. On failure, loops to next candidate.
 
 Request highlights:
 
@@ -150,14 +178,15 @@ Current nodes in `agentShieldAgent.py`:
 
 - `prepare_candidate`
 - `request_voucher`
-- `authorize`
 - `reflect_next_candidate`
 
 Behavior:
 
 - The Brain does **not** haggle or auto-reduce prices.
 - The Brain does **not** force USD normalization.
-- On any rejection, the current candidate is treated as failed and the next candidate is tried.
+- The Brain reserves voucher budget and hands execution to the executor.
+- On any voucher failure or execution failure, the current candidate is treated as failed and the next candidate is tried.
+- Before moving to the next candidate, the orchestrator calls `/v1/release-voucher` to sweep unused funds.
 - Stop conditions:
   - Approved
   - Max cycles reached
@@ -302,13 +331,22 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
 
 
 
-LOOP: 
+LOOP:
 
 Outside request -> Brain
 Brain selects vendor candidate
 Brain asks Gateway for voucher (/v1/request-voucher)
-Brain uses voucher to authorize challenge (/v1/authorize-spend)
-Gateway approves/rejects
-If approved: Brain passes signed intent to payment executor
-Executor attempts payment
+Brain hands session token to executor
+Executor calls vendor endpoint without payment proof
+Vendor returns HTTP 402 challenge (mpp_challenge_id + required amount)
+Executor asks Gateway to authorize that exact challenge (/v1/authorize-spend)
+Gateway approves/rejects challenge authorization
+If approved: executor retries vendor call with signed_payment_intent
+Executor calls /v1/release-voucher to sweep unused reservation
 If execution fails: Brain moves to next vendor and repeats
+
+## FX Accounting Note
+
+- Gateway daily budget is tracked in base currency (USD cents).
+- On `request-voucher`, Gateway converts requested foreign currency amount into USD cents using an FX rate table/oracle before reserving from `budget:daily:*`.
+- Voucher spend still occurs in vendor-requested cents/currency; release logic returns the proportional unused USD reservation.

@@ -6,7 +6,6 @@ import json
 from typing import Any, Dict, List, Optional, TypedDict
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
-import uuid
 
 
 langgraph_module = importlib.import_module("langgraph.graph")
@@ -44,18 +43,16 @@ class AgentBrainState(TypedDict):
     candidates: List[Dict[str, Any]]
     request_voucher_payload: Optional[Dict[str, Any]]
     voucher_response: Optional[Dict[str, Any]]
-    authorize_payload: Optional[Dict[str, Any]]
-    gateway_response: Optional[Dict[str, Any]]
+    selected_candidate: Optional[Dict[str, Any]]
     approved: bool
     done: bool
-    signed_payment_intent: Optional[str]
     reasoning_log: List[str]
     priority: str
     gateway_url: Optional[str]
 
 
 class AgentShieldBrain:
-    """Procurement-style loop: pick candidate, reserve voucher, execute, fallback."""
+    """Procurement loop: pick candidate, reserve voucher, fallback."""
 
     def __init__(self, config: Optional[AgentBrainConfig] = None) -> None:
         self.config = config or AgentBrainConfig()
@@ -65,7 +62,6 @@ class AgentShieldBrain:
         graph = StateGraph(AgentBrainState)
         graph.add_node("prepare_candidate", self._prepare_candidate_node)
         graph.add_node("request_voucher", self._request_voucher_node)
-        graph.add_node("authorize", self._authorize_node)
         graph.add_node("reflect_next_candidate", self._reflect_next_candidate_node)
 
         graph.add_edge(START, "prepare_candidate")
@@ -77,11 +73,6 @@ class AgentShieldBrain:
         graph.add_conditional_edges(
             "request_voucher",
             self._route_after_request_voucher,
-            {"authorize": "authorize", "reflect": "reflect_next_candidate", "done": END},
-        )
-        graph.add_conditional_edges(
-            "authorize",
-            self._route_after_authorize,
             {"approved": END, "reflect": "reflect_next_candidate", "done": END},
         )
         graph.add_conditional_edges(
@@ -106,11 +97,9 @@ class AgentShieldBrain:
             "candidates": [asdict(c) for c in candidates],
             "request_voucher_payload": None,
             "voucher_response": None,
-            "authorize_payload": None,
-            "gateway_response": None,
+            "selected_candidate": None,
             "approved": False,
             "done": False,
-            "signed_payment_intent": None,
             "reasoning_log": [],
             "priority": self.config.priority,
             "gateway_url": self.config.gateway_url,
@@ -118,8 +107,8 @@ class AgentShieldBrain:
         final_state = self.graph.invoke(initial_state)
         return {
             "approved": final_state["approved"],
-            "signed_payment_intent": final_state["signed_payment_intent"],
-            "gateway_response": final_state["gateway_response"],
+            "voucher_response": final_state["voucher_response"],
+            "selected_candidate": final_state["selected_candidate"],
             "cycles_used": final_state["cycles_used"],
             "candidate_index": final_state["candidate_index"],
             "reasoning_log": final_state["reasoning_log"],
@@ -144,9 +133,8 @@ class AgentShieldBrain:
             "requested_amount_cents": int(candidate["amount_cents"]),
             "currency": str(candidate["currency"]),
         }
-        state["authorize_payload"] = None
         state["voucher_response"] = None
-        state["gateway_response"] = None
+        state["selected_candidate"] = candidate
         state["reasoning_log"].append(
             "Prepared voucher request for "
             f"{candidate['recipient']} at {int(candidate['amount_cents'])} {str(candidate['currency']).upper()} cents."
@@ -163,36 +151,15 @@ class AgentShieldBrain:
 
         decision = str(response.get("decision", "REJECTED")).upper()
         if decision == "APPROVED" and response.get("session_token"):
-            state["reasoning_log"].append("Voucher reserved successfully; proceeding to challenge authorization.")
-            candidate = state["candidates"][state["candidate_index"]]
-            state["authorize_payload"] = {
-                "session_token": response["session_token"],
-                "mpp_challenge_id": f"ch_{state['agent_id']}_{uuid.uuid4().hex[:10]}",
-                "amount_cents": int(candidate["amount_cents"]),
-            }
-            return state
-
-        state["reasoning_log"].append("Voucher request rejected; marking candidate as failed.")
-        return state
-
-    def _authorize_node(self, state: AgentBrainState) -> AgentBrainState:
-        if state["done"] or not state["authorize_payload"]:
-            state["done"] = True
-            return state
-
-        response = self._call_authorize_spend(state["authorize_payload"], state["gateway_url"])
-        state["gateway_response"] = response
-        decision = str(response.get("decision", "REJECTED")).upper()
-
-        if decision == "APPROVED":
             state["approved"] = True
             state["done"] = True
-            state["signed_payment_intent"] = response.get("signed_payment_intent")
-            state["reasoning_log"].append("Vendor challenge approved; handoff token issued.")
+            state["reasoning_log"].append(
+                "Voucher reserved successfully; handing session token to executor for 402 handshake."
+            )
             return state
 
         state["approved"] = False
-        state["reasoning_log"].append("Vendor challenge rejected; marking candidate as failed.")
+        state["reasoning_log"].append("Voucher request rejected; marking candidate as failed.")
         return state
 
     def _reflect_next_candidate_node(self, state: AgentBrainState) -> AgentBrainState:
@@ -219,17 +186,10 @@ class AgentShieldBrain:
 
     def _route_after_request_voucher(self, state: AgentBrainState) -> str:
         if state["done"]:
-            return "done"
+            return "approved" if state["approved"] else "done"
         response = state.get("voucher_response") or {}
         approved = str(response.get("decision", "REJECTED")).upper() == "APPROVED"
-        return "authorize" if approved and state.get("authorize_payload") else "reflect"
-
-    def _route_after_authorize(self, state: AgentBrainState) -> str:
-        if state["done"] and state["approved"]:
-            return "approved"
-        if state["done"]:
-            return "done"
-        return "reflect"
+        return "approved" if approved else "reflect"
 
     def _route_after_reflect(self, state: AgentBrainState) -> str:
         return "done" if state["done"] else "retry"
@@ -244,22 +204,6 @@ class AgentShieldBrain:
             redis_client = gateway_module.redis.from_url(gateway_module.config.redis_url, decode_responses=True)
             try:
                 response_model = await gateway_module.request_voucher_core(redis_client, request_model)
-                return response_model.model_dump(mode="json")
-            finally:
-                await redis_client.aclose()
-
-        return self._run_async(_run())
-
-    def _call_authorize_spend(self, payload: Dict[str, Any], gateway_url: Optional[str]) -> Dict[str, Any]:
-        if gateway_url:
-            return self._post_json(gateway_url.rstrip("/") + "/v1/authorize-spend", payload)
-        gateway_module = importlib.import_module("agentShieldAPI")
-        request_model = gateway_module.AuthorizeSpendRequest(**payload)
-
-        async def _run():
-            redis_client = gateway_module.redis.from_url(gateway_module.config.redis_url, decode_responses=True)
-            try:
-                response_model = await gateway_module.authorize_spend_core(redis_client, request_model)
                 return response_model.model_dump(mode="json")
             finally:
                 await redis_client.aclose()
