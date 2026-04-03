@@ -8,6 +8,19 @@ This repository implements a two-plane payment control system:
 The Brain decides *what to try next*.  
 The Gateway decides *whether spending is allowed right now*.
 
+## Canonical End-to-End Flow
+
+1. Client calls `POST /v1/process-payment`.
+2. Brain picks a candidate and requests voucher budget via `POST /v1/request-voucher`.
+3. Gateway reserves budget (USD-normalized), creates voucher, returns `session_token`.
+4. Executor calls vendor endpoint without payment proof.
+5. Vendor returns `HTTP 402` with `mpp_challenge_id` (+ amount/currency when provided).
+6. Executor calls `POST /v1/authorize-spend` with that exact challenge.
+7. Gateway runs replay + voucher checks, deducts voucher, returns `signed_payment_intent`.
+8. Executor retries vendor call with signed intent attached.
+9. Executor calls `POST /v1/release-voucher` to sweep any unused reserved budget.
+10. If execution fails, Brain moves to next candidate and repeats.
+
 ## Architecture
 
 ```text
@@ -186,7 +199,6 @@ Behavior:
 - The Brain does **not** force USD normalization.
 - The Brain reserves voucher budget and hands execution to the executor.
 - On any voucher failure or execution failure, the current candidate is treated as failed and the next candidate is tried.
-- Before moving to the next candidate, the orchestrator calls `/v1/release-voucher` to sweep unused funds.
 - Stop conditions:
   - Approved
   - Max cycles reached
@@ -298,29 +310,17 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
 ## MPP Adapter Modes
 
 - `mock`: returns synthetic `SUCCEEDED`.
-- `real` (recommended): executes `tempo request` against the approved `recipient` URL from the signed intent.
-  - Requires an authenticated Tempo CLI session (`tempo wallet login`).
-  - Optional: `TEMPO_USE_CLI=false` disables CLI path.
-  - Optional tuning env vars:
-    - `TEMPO_REQUEST_TIMEOUT_SECONDS` (default `60`)
-    - `TEMPO_REQUEST_CONNECT_TIMEOUT_SECONDS` (default `10`)
-    - `TEMPO_REQUEST_RETRIES` (default `1`)
-    - `TEMPO_REQUEST_RETRY_BACKOFF_MS` (default `400`)
-    - `TEMPO_REQUEST_METHOD` (default `POST`)
-    - `TEMPO_NETWORK` (e.g. `testnet`)
-    - `TEMPO_REQUEST_JSON` (override JSON body for endpoint-specific schemas)
-- `real` fallback (legacy direct POST):
-  - Set `TEMPO_MPP_API_KEY` + `TEMPO_MPP_ENDPOINT` to force direct provider request mode.
-  - Uses headers:
-    - `Authorization: Bearer <TEMPO_MPP_API_KEY>`
-    - `Idempotency-Key: <mpp_challenge_id>`
-    - `X-AgentShield-Intent-Version: v1`
+- `real`: runs protocol-sequenced HTTP 402 handshake:
+  - probe vendor request -> capture `402` challenge
+  - authorize exact challenge via gateway
+  - retry vendor request with signed intent
+  - release unused voucher reservation
 
 ## Current Limitations
 
-- Real MPP integration is still placeholder logic.
 - API endpoints currently have no auth layer.
 - Vendor trust/verification is minimal and should be hardened.
+- Challenge parsing currently relies on common header/body conventions; vendor-specific adapters may still be required.
 
 ## Files
 
@@ -330,20 +330,6 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
 
 
 
-
-LOOP:
-
-Outside request -> Brain
-Brain selects vendor candidate
-Brain asks Gateway for voucher (/v1/request-voucher)
-Brain hands session token to executor
-Executor calls vendor endpoint without payment proof
-Vendor returns HTTP 402 challenge (mpp_challenge_id + required amount)
-Executor asks Gateway to authorize that exact challenge (/v1/authorize-spend)
-Gateway approves/rejects challenge authorization
-If approved: executor retries vendor call with signed_payment_intent
-Executor calls /v1/release-voucher to sweep unused reservation
-If execution fails: Brain moves to next vendor and repeats
 
 ## FX Accounting Note
 
