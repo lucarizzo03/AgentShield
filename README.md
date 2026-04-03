@@ -315,6 +315,7 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
   - authorize exact challenge via gateway
   - retry vendor request with signed intent
   - release unused voucher reservation
+  - if vendor edge blocks direct probe (e.g. HTTP 403/1010), optional fallback uses `tempo request` transport (`TEMPO_FALLBACK_ON_BLOCK=true`, default true)
 
 ## Current Limitations
 

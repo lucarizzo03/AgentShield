@@ -588,6 +588,103 @@ def _extract_402_details(exc: HTTPError) -> Dict[str, object]:
     return out
 
 
+def _execute_via_tempo_cli(*, vendor_url: str, task_description: str, max_spend_cents: int) -> MPPExecutionResult:
+    now = utc_now_iso()
+    if not shutil.which("tempo"):
+        return MPPExecutionResult(
+            attempted=False,
+            status="NOT_CONFIGURED",
+            transaction_id=None,
+            provider="tempo-cli",
+            message="tempo CLI not found for fallback transport.",
+            executed_at=now,
+        )
+
+    timeout_seconds = max(5, int(os.getenv("TEMPO_REQUEST_TIMEOUT_SECONDS", "60")))
+    connect_timeout_seconds = max(2, int(os.getenv("TEMPO_REQUEST_CONNECT_TIMEOUT_SECONDS", "10")))
+    retries = max(0, int(os.getenv("TEMPO_REQUEST_RETRIES", "1")))
+    retry_backoff_ms = max(50, int(os.getenv("TEMPO_REQUEST_RETRY_BACKOFF_MS", "400")))
+    method = os.getenv("TEMPO_REQUEST_METHOD", "POST").strip().upper() or "POST"
+    network = os.getenv("TEMPO_NETWORK", "").strip()
+
+    vendor_payload: Dict[str, object] = {"prompt": task_description}
+    custom_json = os.getenv("TEMPO_REQUEST_JSON", "").strip()
+    if custom_json:
+        try:
+            parsed = json.loads(custom_json)
+            if isinstance(parsed, dict):
+                vendor_payload = parsed
+        except Exception:
+            pass
+
+    cmd = [
+        "tempo",
+        "request",
+        "--json-output",
+        "--silent",
+        "--max-spend",
+        f"{max(1, max_spend_cents) / 100.0:.2f}",
+        "--timeout",
+        str(timeout_seconds),
+        "--connect-timeout",
+        str(connect_timeout_seconds),
+        "--retries",
+        str(retries),
+        "--retry-backoff",
+        str(retry_backoff_ms),
+        "-X",
+        method,
+        "--json",
+        json.dumps(vendor_payload),
+        vendor_url,
+    ]
+    if network:
+        cmd.extend(["--network", network])
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds + 10)
+    except subprocess.TimeoutExpired:
+        return MPPExecutionResult(
+            attempted=True,
+            status="PROVIDER_TIMEOUT",
+            transaction_id=None,
+            provider="tempo-cli",
+            message="tempo request fallback timed out.",
+            executed_at=utc_now_iso(),
+        )
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return MPPExecutionResult(
+            attempted=True,
+            status="PROVIDER_HTTP_ERROR",
+            transaction_id=None,
+            provider="tempo-cli",
+            message=f"tempo fallback failed: {stderr or 'non-zero exit'}" + (f" | stdout={stdout[:400]}" if stdout else ""),
+            executed_at=utc_now_iso(),
+        )
+
+    parsed = {}
+    if stdout.startswith("{") and stdout.endswith("}"):
+        try:
+            parsed = json.loads(stdout)
+        except Exception:
+            parsed = {}
+    tx_id = parsed.get("transaction_id") or parsed.get("id")
+    if not tx_id:
+        match = re.search(r"(tx_[A-Za-z0-9_-]+|mpp_[A-Za-z0-9_-]+)", stdout)
+        tx_id = match.group(1) if match else None
+    return MPPExecutionResult(
+        attempted=True,
+        status="SUCCEEDED",
+        transaction_id=str(tx_id) if tx_id else None,
+        provider="tempo-cli",
+        message="Payment executed via tempo CLI fallback transport.",
+        executed_at=utc_now_iso(),
+    )
+
+
 async def execute_mpp_402_handshake(
     *,
     redis_client: redis.Redis,
@@ -624,6 +721,13 @@ async def execute_mpp_402_handshake(
     except HTTPError as exc:
         if exc.code != 402:
             body = exc.read().decode("utf-8") if exc.fp else ""
+            fallback_enabled = os.getenv("TEMPO_FALLBACK_ON_BLOCK", "true").strip().lower() in {"1", "true", "yes"}
+            if fallback_enabled and exc.code == 403 and ("1010" in body or "Access denied" in body or "Forbidden" in body):
+                return _execute_via_tempo_cli(
+                    vendor_url=vendor_url,
+                    task_description=task_description,
+                    max_spend_cents=fallback_amount,
+                )
             return MPPExecutionResult(
                 attempted=True,
                 status="PROVIDER_HTTP_ERROR",
