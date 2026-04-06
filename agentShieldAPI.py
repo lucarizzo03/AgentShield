@@ -17,7 +17,7 @@ import shutil
 import subprocess
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 import redis.asyncio as redis
@@ -107,6 +107,9 @@ class MPPExecutionResult(BaseModel):
     transaction_id: Optional[str]
     provider: str
     execution_path: Optional[str] = None
+    vendor_http_status: Optional[int] = None
+    vendor_response_preview: Optional[str] = None
+    vendor_response_json: Optional[Dict[str, Any]] = None
     message: str
     executed_at: str
 
@@ -653,6 +656,25 @@ def _extract_402_details(exc: HTTPError) -> Dict[str, object]:
     return out
 
 
+def _preview_text(value: str, limit: int = 600) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "...<truncated>"
+
+
+def _try_parse_json(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        parsed = json.loads(stripped)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
 def _execute_via_tempo_cli(*, vendor_url: str, task_description: str, max_spend_cents: int) -> MPPExecutionResult:
     now = utc_now_iso()
     if not shutil.which("tempo"):
@@ -722,6 +744,7 @@ def _execute_via_tempo_cli(*, vendor_url: str, task_description: str, max_spend_
 
     stdout = (proc.stdout or "").strip()
     stderr = (proc.stderr or "").strip()
+    parsed_stdout = _try_parse_json(stdout)
     if proc.returncode != 0:
         return MPPExecutionResult(
             attempted=True,
@@ -729,16 +752,14 @@ def _execute_via_tempo_cli(*, vendor_url: str, task_description: str, max_spend_
             transaction_id=None,
             provider="tempo-cli",
             execution_path="tempo_cli_fallback",
+            vendor_http_status=None,
+            vendor_response_preview=_preview_text(stdout) if stdout else None,
+            vendor_response_json=parsed_stdout,
             message=f"tempo fallback failed: {stderr or 'non-zero exit'}" + (f" | stdout={stdout[:400]}" if stdout else ""),
             executed_at=utc_now_iso(),
         )
 
-    parsed = {}
-    if stdout.startswith("{") and stdout.endswith("}"):
-        try:
-            parsed = json.loads(stdout)
-        except Exception:
-            parsed = {}
+    parsed = parsed_stdout or {}
     tx_id = parsed.get("transaction_id") or parsed.get("id")
     if not tx_id:
         match = re.search(r"(tx_[A-Za-z0-9_-]+|mpp_[A-Za-z0-9_-]+)", stdout)
@@ -749,6 +770,9 @@ def _execute_via_tempo_cli(*, vendor_url: str, task_description: str, max_spend_
         transaction_id=str(tx_id) if tx_id else None,
         provider="tempo-cli",
         execution_path="tempo_cli_fallback",
+        vendor_http_status=200,
+        vendor_response_preview=_preview_text(stdout) if stdout else None,
+        vendor_response_json=parsed if parsed else None,
         message="Payment executed via tempo CLI fallback transport.",
         executed_at=utc_now_iso(),
     )
@@ -779,13 +803,18 @@ async def execute_mpp_402_handshake(
     initial_req = _build_vendor_request(url=vendor_url, task_description=task_description, signed_payment_intent=None)
     try:
         # Some endpoints can return 200 without payment challenge.
-        with urllib_request.urlopen(initial_req, timeout=20):
+        with urllib_request.urlopen(initial_req, timeout=20) as resp:
+            body = resp.read().decode("utf-8")
+            parsed_body = _try_parse_json(body)
             return MPPExecutionResult(
                 attempted=True,
                 status="SUCCEEDED",
                 transaction_id=None,
                 provider="tempo-mpp-http",
                 execution_path="direct_402_http",
+                vendor_http_status=resp.status,
+                vendor_response_preview=_preview_text(body) if body else None,
+                vendor_response_json=parsed_body,
                 message="Vendor request succeeded without 402 challenge.",
                 executed_at=utc_now_iso(),
             )
@@ -805,6 +834,9 @@ async def execute_mpp_402_handshake(
                 transaction_id=None,
                 provider="tempo-mpp-http",
                 execution_path="direct_402_http",
+                vendor_http_status=exc.code,
+                vendor_response_preview=_preview_text(body) if body else None,
+                vendor_response_json=_try_parse_json(body),
                 message=f"Vendor returned HTTP {exc.code} before challenge authorization: {body or 'no body'}",
                 executed_at=utc_now_iso(),
             )
@@ -861,6 +893,8 @@ async def execute_mpp_402_handshake(
     )
     try:
         with urllib_request.urlopen(retry_req, timeout=20) as resp:
+            body = resp.read().decode("utf-8")
+            parsed_body = _try_parse_json(body)
             tx_id = resp.headers.get("x-mpp-transaction-id") or resp.headers.get("x-transaction-id")
             return MPPExecutionResult(
                 attempted=True,
@@ -868,6 +902,9 @@ async def execute_mpp_402_handshake(
                 transaction_id=tx_id,
                 provider="tempo-mpp-http",
                 execution_path="direct_402_http",
+                vendor_http_status=resp.status,
+                vendor_response_preview=_preview_text(body) if body else None,
+                vendor_response_json=parsed_body,
                 message="402 challenge authorized and vendor request succeeded on retry.",
                 executed_at=utc_now_iso(),
             )
@@ -879,6 +916,9 @@ async def execute_mpp_402_handshake(
             transaction_id=None,
             provider="tempo-mpp-http",
             execution_path="direct_402_http",
+            vendor_http_status=exc.code,
+            vendor_response_preview=_preview_text(body) if body else None,
+            vendor_response_json=_try_parse_json(body),
             message=f"Vendor rejected retry after authorization (HTTP {exc.code}): {body or 'no body'}",
             executed_at=utc_now_iso(),
         )

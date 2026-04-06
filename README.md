@@ -234,6 +234,9 @@ Execution response note:
   - `direct_402_http`
   - `tempo_cli_fallback`
   - `mock_adapter`
+- `mpp_execution.vendor_http_status` includes the vendor HTTP status when available.
+- `mpp_execution.vendor_response_preview` includes a truncated copy of the vendor/transport response payload.
+- `mpp_execution.vendor_response_json` includes parsed JSON payload (when the response is valid JSON).
 
 ## Brain Loop (LangGraph)
 
@@ -308,9 +311,9 @@ curl -X POST http://127.0.0.1:8000/v1/request-voucher \
   -H "Content-Type: application/json" \
   -d '{
     "agent_id": "agent_alpha",
-    "vendor_url": "https://realdataapi.com/v1/listings",
-    "requested_amount_cents": 120,
-    "currency": "EUR"
+    "vendor_url": "https://fal.mpp.tempo.xyz/fal-ai/flux/dev",
+    "requested_amount_cents": 5,
+    "currency": "USD"
   }'
 ```
 
@@ -321,10 +324,12 @@ curl -X POST http://127.0.0.1:8000/v1/authorize-spend \
   -H "Content-Type: application/json" \
   -d '{
     "session_token": "REPLACE_WITH_SESSION_TOKEN",
-    "mpp_challenge_id": "ch_agent_alpha_abc123",
-    "amount_cents": 120
+    "mpp_challenge_id": "mpp_ch_01JQ7F2X9Y4R8K3T6N1B5V",
+    "amount_cents": 5
   }'
 ```
+
+Use the exact challenge ID returned by the vendor `HTTP 402` (typically from `x-mpp-challenge-id`).
 
 ### 3) Full process-payment
 
@@ -333,20 +338,20 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
   -H "Content-Type: application/json" \
   -d '{
     "agent_id": "agent_alpha",
-    "task_description": "Scrape 500 real estate listings and enrich owner contact data",
+    "task_description": "a sunset over the ocean",
     "candidates": [
       {
-        "description": "Primary data API",
-        "amount_cents": 120,
-        "currency": "EUR",
-        "recipient": "https://realdataapi.com/v1/listings",
+        "description": "FAL Flux primary",
+        "amount_cents": 5,
+        "currency": "USD",
+        "recipient": "https://fal.mpp.tempo.xyz/fal-ai/flux/dev",
         "recurring": false
       },
       {
-        "description": "Backup API",
-        "amount_cents": 95,
-        "currency": "EUR",
-        "recipient": "https://datasourcehub.io/api/search",
+        "description": "FAL Flux backup candidate",
+        "amount_cents": 6,
+        "currency": "USD",
+        "recipient": "https://fal.mpp.tempo.xyz/fal-ai/flux/dev",
         "recurring": false
       }
     ],
