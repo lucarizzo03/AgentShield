@@ -106,6 +106,7 @@ class MPPExecutionResult(BaseModel):
     status: str
     transaction_id: Optional[str]
     provider: str
+    execution_path: Optional[str] = None
     message: str
     executed_at: str
 
@@ -121,37 +122,99 @@ registered_agents = {"agent_alpha", "agent_beta", "agent_ops"}
 
 
 RESERVE_DAILY_BUDGET_LUA = """
-local key = KEYS[1]
-local cap = tonumber(ARGV[1])
-local requested = tonumber(ARGV[2])
+local budget_key = KEYS[1]
+local voucher_key = KEYS[2]
+local meta_key = KEYS[3]
 
-if redis.call('EXISTS', key) == 0 then
-  redis.call('SET', key, cap)
+local requested_usd = tonumber(ARGV[1])
+local requested_vendor_cents = tonumber(ARGV[2])
+local ttl_seconds = tonumber(ARGV[3])
+local meta_agent_id = ARGV[4]
+local meta_vendor_url = ARGV[5]
+local meta_currency = ARGV[6]
+
+local current_budget = redis.call("GET", budget_key)
+if not current_budget then
+    return {0, 0, "NO_BUDGET_FOUND"}
 end
+current_budget = tonumber(current_budget)
 
-local current = tonumber(redis.call('GET', key))
-if current < requested then
-  return -1
+if current_budget >= requested_usd then
+    redis.call("DECRBY", budget_key, requested_usd)
+    redis.call("SETEX", voucher_key, ttl_seconds, requested_vendor_cents)
+    redis.call("HSET", meta_key,
+        "agent_id", meta_agent_id,
+        "vendor_url", meta_vendor_url,
+        "currency", meta_currency,
+        "requested_vendor_cents", requested_vendor_cents,
+        "reserved_usd_cents", requested_usd,
+        "budget_key", budget_key
+    )
+    redis.call("EXPIRE", meta_key, ttl_seconds)
+    local remaining_budget = current_budget - requested_usd
+    return {1, remaining_budget, "APPROVED"}
+else
+    return {0, current_budget, "INSUFFICIENT_FUNDS"}
 end
-
-return redis.call('DECRBY', key, requested)
 """
 
 
 DECREMENT_VOUCHER_LUA = """
-local key = KEYS[1]
-local spend = tonumber(ARGV[1])
+local voucher_key = KEYS[1]
+local challenge_key = KEYS[2]
 
-if redis.call('EXISTS', key) == 0 then
-  return -2
+local amount_cents = tonumber(ARGV[1])
+local challenge_ttl = tonumber(ARGV[2])
+
+local is_new_challenge = redis.call("SET", challenge_key, "1", "NX", "EX", challenge_ttl)
+if not is_new_challenge then
+    return {0, -1, "REJECTED_REPLAY_DETECTED"}
 end
 
-local current = tonumber(redis.call('GET', key))
-if current < spend then
-  return -1
+local current_balance = redis.call("GET", voucher_key)
+if not current_balance then
+    return {0, -1, "REJECTED_VOUCHER_EXPIRED_OR_MISSING"}
 end
 
-return redis.call('DECRBY', key, spend)
+current_balance = tonumber(current_balance)
+if current_balance >= amount_cents then
+    local new_balance = redis.call("DECRBY", voucher_key, amount_cents)
+    return {1, new_balance, "APPROVED"}
+else
+    return {0, current_balance, "REJECTED_INSUFFICIENT_VOUCHER_FUNDS"}
+end
+"""
+
+
+RELEASE_VOUCHER_LUA = """
+local voucher_key = KEYS[1]
+local meta_key = KEYS[2]
+
+local balance_str = redis.call("GET", voucher_key)
+if not balance_str then
+    return {0, 0, "VOUCHER_NOT_FOUND"}
+end
+
+local balance = tonumber(balance_str)
+local meta = redis.call("HMGET", meta_key, "requested_vendor_cents", "reserved_usd_cents", "budget_key")
+
+local requested_vendor = tonumber(meta[1])
+local reserved_usd = tonumber(meta[2])
+local budget_key = meta[3]
+
+local refund_usd = 0
+if requested_vendor and requested_vendor > 0 then
+    refund_usd = math.floor((balance / requested_vendor) * reserved_usd)
+end
+
+if refund_usd > 0 then
+    redis.call("INCRBY", budget_key, refund_usd)
+end
+
+redis.call("DEL", voucher_key)
+redis.call("DEL", meta_key)
+
+return {1, refund_usd, "RELEASED"}
 """
 
 
@@ -499,6 +562,7 @@ def execute_mpp_payment(
             status="SUCCEEDED",
             transaction_id=tx_id,
             provider="tempo-mpp-mock",
+            execution_path="mock_adapter",
             message="Mock MPP execution succeeded.",
             executed_at=now,
         )
@@ -514,6 +578,7 @@ def execute_mpp_payment(
         status="INVALID_MODE",
         transaction_id=None,
         provider="tempo-mpp",
+        execution_path="adapter_dispatch",
         message="Unsupported mpp_mode. Use 'mock' or 'real'.",
         executed_at=now,
     )
@@ -596,6 +661,7 @@ def _execute_via_tempo_cli(*, vendor_url: str, task_description: str, max_spend_
             status="NOT_CONFIGURED",
             transaction_id=None,
             provider="tempo-cli",
+            execution_path="tempo_cli_fallback",
             message="tempo CLI not found for fallback transport.",
             executed_at=now,
         )
@@ -649,6 +715,7 @@ def _execute_via_tempo_cli(*, vendor_url: str, task_description: str, max_spend_
             status="PROVIDER_TIMEOUT",
             transaction_id=None,
             provider="tempo-cli",
+            execution_path="tempo_cli_fallback",
             message="tempo request fallback timed out.",
             executed_at=utc_now_iso(),
         )
@@ -661,6 +728,7 @@ def _execute_via_tempo_cli(*, vendor_url: str, task_description: str, max_spend_
             status="PROVIDER_HTTP_ERROR",
             transaction_id=None,
             provider="tempo-cli",
+            execution_path="tempo_cli_fallback",
             message=f"tempo fallback failed: {stderr or 'non-zero exit'}" + (f" | stdout={stdout[:400]}" if stdout else ""),
             executed_at=utc_now_iso(),
         )
@@ -680,6 +748,7 @@ def _execute_via_tempo_cli(*, vendor_url: str, task_description: str, max_spend_
         status="SUCCEEDED",
         transaction_id=str(tx_id) if tx_id else None,
         provider="tempo-cli",
+        execution_path="tempo_cli_fallback",
         message="Payment executed via tempo CLI fallback transport.",
         executed_at=utc_now_iso(),
     )
@@ -701,6 +770,7 @@ async def execute_mpp_402_handshake(
             status="INVALID_RECIPIENT",
             transaction_id=None,
             provider="tempo-mpp",
+            execution_path="direct_402_http",
             message="Missing vendor recipient URL.",
             executed_at=now,
         )
@@ -715,6 +785,7 @@ async def execute_mpp_402_handshake(
                 status="SUCCEEDED",
                 transaction_id=None,
                 provider="tempo-mpp-http",
+                execution_path="direct_402_http",
                 message="Vendor request succeeded without 402 challenge.",
                 executed_at=utc_now_iso(),
             )
@@ -733,6 +804,7 @@ async def execute_mpp_402_handshake(
                 status="PROVIDER_HTTP_ERROR",
                 transaction_id=None,
                 provider="tempo-mpp-http",
+                execution_path="direct_402_http",
                 message=f"Vendor returned HTTP {exc.code} before challenge authorization: {body or 'no body'}",
                 executed_at=utc_now_iso(),
             )
@@ -743,6 +815,7 @@ async def execute_mpp_402_handshake(
             status="PROVIDER_NETWORK_ERROR",
             transaction_id=None,
             provider="tempo-mpp-http",
+            execution_path="direct_402_http",
             message=f"Vendor network error during challenge probe: {exc}",
             executed_at=utc_now_iso(),
         )
@@ -754,6 +827,7 @@ async def execute_mpp_402_handshake(
             status="CHALLENGE_PARSE_ERROR",
             transaction_id=None,
             provider="tempo-mpp-http",
+            execution_path="direct_402_http",
             message=f"Vendor returned 402 but no parseable challenge ID. Body: {challenge.get('raw_body', '')}",
             executed_at=utc_now_iso(),
         )
@@ -774,6 +848,7 @@ async def execute_mpp_402_handshake(
             status="AUTHORIZATION_REJECTED",
             transaction_id=None,
             provider="tempo-mpp-http",
+            execution_path="direct_402_http",
             message=f"Gateway rejected challenge authorization: {auth_response.rejection_guidance or 'no guidance'}",
             executed_at=utc_now_iso(),
         )
@@ -792,6 +867,7 @@ async def execute_mpp_402_handshake(
                 status="SUCCEEDED",
                 transaction_id=tx_id,
                 provider="tempo-mpp-http",
+                execution_path="direct_402_http",
                 message="402 challenge authorized and vendor request succeeded on retry.",
                 executed_at=utc_now_iso(),
             )
@@ -802,6 +878,7 @@ async def execute_mpp_402_handshake(
             status="PROVIDER_HTTP_ERROR",
             transaction_id=None,
             provider="tempo-mpp-http",
+            execution_path="direct_402_http",
             message=f"Vendor rejected retry after authorization (HTTP {exc.code}): {body or 'no body'}",
             executed_at=utc_now_iso(),
         )
@@ -811,6 +888,7 @@ async def execute_mpp_402_handshake(
             status="PROVIDER_NETWORK_ERROR",
             transaction_id=None,
             provider="tempo-mpp-http",
+            execution_path="direct_402_http",
             message=f"Vendor network error on authorized retry: {exc}",
             executed_at=utc_now_iso(),
         )
@@ -838,91 +916,80 @@ async def request_voucher_core(r: redis.Redis, payload: RequestVoucherRequest) -
             rejection_guidance=str(exc),
         )
 
-    reserve = await r.eval(
+    # runs the lua script to reserve the budget
+    await r.setnx(daily_key, config.daily_cap_cents)
+    session_token = secrets.token_urlsafe(24)
+    balance_key = voucher_balance_key(session_token)
+    meta_key = voucher_meta_key(session_token)
+    vendor = normalize_vendor(payload.vendor_url)
+    reserve_raw = await r.eval(
         RESERVE_DAILY_BUDGET_LUA,
-        1,
+        3,
         daily_key,
-        config.daily_cap_cents,
+        balance_key,
+        meta_key,
         reserve_budget_cents,
+        payload.requested_amount_cents,
+        config.voucher_ttl_seconds,
+        payload.agent_id,
+        vendor,
+        payload.currency.upper(),
     )
+    reserve = list(reserve_raw) if isinstance(reserve_raw, (list, tuple)) else [0, 0, "UNKNOWN"]
+    approved = int(reserve[0]) if len(reserve) > 0 else 0
+    remaining = int(reserve[1]) if len(reserve) > 1 else 0
+    status_code = str(reserve[2]) if len(reserve) > 2 else "UNKNOWN"
 
-    if int(reserve) < 0:
-        current_budget = await r.get(daily_key)
-        remaining = int(current_budget) if current_budget is not None else config.daily_cap_cents
+    if approved != 1:
         return RequestVoucherResponse(
             decision=Decision.REJECTED,
             session_token=None,
             voucher_remaining_cents=0,
             daily_budget_remaining_cents=remaining,
-            rejection_guidance="Daily budget cap exceeded for this request.",
+            rejection_guidance=(
+                "Daily budget cap exceeded for this request."
+                if status_code == "INSUFFICIENT_FUNDS"
+                else f"Voucher reservation rejected: {status_code}"
+            ),
         )
-
-    session_token = secrets.token_urlsafe(24)
-    balance_key = voucher_balance_key(session_token)
-    meta_key = voucher_meta_key(session_token)
-    vendor = normalize_vendor(payload.vendor_url)
-
-    async with r.pipeline() as pipe:
-        pipe.set(balance_key, payload.requested_amount_cents, ex=config.voucher_ttl_seconds)
-        pipe.hset(
-            meta_key,
-            mapping={
-                "agent_id": payload.agent_id,
-                "vendor_url": vendor,
-                "currency": payload.currency.upper(),
-                "created_at": utc_now_iso(),
-                "requested_amount_cents": str(payload.requested_amount_cents),
-                "reserved_budget_cents": str(reserve_budget_cents),
-                "budget_day_key": daily_key,
-            },
-        )
-        pipe.expire(meta_key, config.voucher_ttl_seconds)
-        await pipe.execute()
 
     return RequestVoucherResponse(
         decision=Decision.APPROVED,
         session_token=session_token,
         voucher_remaining_cents=payload.requested_amount_cents,
-        daily_budget_remaining_cents=int(reserve),
+        daily_budget_remaining_cents=remaining,
         rejection_guidance=None,
     )
 
 
 async def authorize_spend_core(r: redis.Redis, payload: AuthorizeSpendRequest) -> AuthorizeSpendResponse:
-    replay_ok = await r.set(
-        challenge_key(payload.mpp_challenge_id),
-        "1",
-        ex=config.challenge_ttl_seconds,
-        nx=True,
-    )
-    if not replay_ok:
-        return AuthorizeSpendResponse(
-            decision=Decision.REJECTED,
-            signed_payment_intent=None,
-            voucher_remaining_cents=0,
-            rejection_guidance="Replay detected: mpp_challenge_id already used.",
-        )
-
     balance_key = voucher_balance_key(payload.session_token)
     meta_key = voucher_meta_key(payload.session_token)
-    voucher_remaining = await r.eval(DECREMENT_VOUCHER_LUA, 1, balance_key, payload.amount_cents)
-    voucher_remaining_int = int(voucher_remaining)
+    challenge_id_key = challenge_key(payload.mpp_challenge_id)
+    auth_raw = await r.eval(
+        DECREMENT_VOUCHER_LUA,
+        2,
+        balance_key,
+        challenge_id_key,
+        payload.amount_cents,
+        config.challenge_ttl_seconds,
+    )
+    auth = list(auth_raw) if isinstance(auth_raw, (list, tuple)) else [0, -1, "UNKNOWN"]
+    approved = int(auth[0]) if len(auth) > 0 else 0
+    voucher_remaining_int = int(auth[1]) if len(auth) > 1 else -1
+    status_code = str(auth[2]) if len(auth) > 2 else "UNKNOWN"
 
-    if voucher_remaining_int == -2:
+    if approved != 1:
+        guidance = {
+            "REJECTED_REPLAY_DETECTED": "Replay detected: mpp_challenge_id already used.",
+            "REJECTED_VOUCHER_EXPIRED_OR_MISSING": "Invalid or expired session_token.",
+            "REJECTED_INSUFFICIENT_VOUCHER_FUNDS": "Insufficient voucher balance.",
+        }.get(status_code, f"Authorization rejected: {status_code}")
         return AuthorizeSpendResponse(
             decision=Decision.REJECTED,
             signed_payment_intent=None,
-            voucher_remaining_cents=0,
-            rejection_guidance="Invalid or expired session_token.",
-        )
-    if voucher_remaining_int < 0:
-        current = await r.get(balance_key)
-        current_remaining = int(current) if current is not None else 0
-        return AuthorizeSpendResponse(
-            decision=Decision.REJECTED,
-            signed_payment_intent=None,
-            voucher_remaining_cents=current_remaining,
-            rejection_guidance="Insufficient voucher balance.",
+            voucher_remaining_cents=max(0, voucher_remaining_int),
+            rejection_guidance=guidance,
         )
 
     voucher_meta = await r.hgetall(meta_key)
@@ -947,33 +1014,26 @@ async def authorize_spend_core(r: redis.Redis, payload: AuthorizeSpendRequest) -
 async def release_voucher_core(r: redis.Redis, payload: ReleaseVoucherRequest) -> ReleaseVoucherResponse:
     balance_key = voucher_balance_key(payload.session_token)
     meta_key = voucher_meta_key(payload.session_token)
-    meta = await r.hgetall(meta_key)
-    if not meta:
+    budget_day = await r.hget(meta_key, "budget_key")
+    if not budget_day:
         return ReleaseVoucherResponse(
             decision=Decision.REJECTED,
             released_budget_cents=0,
             daily_budget_remaining_cents=0,
             rejection_guidance="Voucher metadata not found (already released or expired).",
         )
-
-    balance_raw = await r.get(balance_key)
-    remaining_voucher_cents = int(balance_raw) if balance_raw is not None else 0
-    requested_amount = int(meta.get("requested_amount_cents", "0") or 0)
-    reserved_budget = int(meta.get("reserved_budget_cents", "0") or 0)
-    budget_day = meta.get("budget_day_key") or daily_budget_key(str(meta.get("agent_id", "")))
-
-    released_budget_cents = 0
-    if requested_amount > 0 and reserved_budget > 0 and remaining_voucher_cents > 0:
-        # Return proportional remaining budget reservation back to daily pool.
-        released_budget_cents = int((remaining_voucher_cents * reserved_budget) / requested_amount)
-        released_budget_cents = max(0, min(reserved_budget, released_budget_cents))
-
-    async with r.pipeline() as pipe:
-        if released_budget_cents > 0:
-            pipe.incrby(budget_day, released_budget_cents)
-        pipe.delete(balance_key)
-        pipe.delete(meta_key)
-        await pipe.execute()
+    release_raw = await r.eval(RELEASE_VOUCHER_LUA, 2, balance_key, meta_key)
+    release = list(release_raw) if isinstance(release_raw, (list, tuple)) else [0, 0, "UNKNOWN"]
+    released_ok = int(release[0]) if len(release) > 0 else 0
+    released_budget_cents = int(release[1]) if len(release) > 1 else 0
+    status_code = str(release[2]) if len(release) > 2 else "UNKNOWN"
+    if released_ok != 1:
+        return ReleaseVoucherResponse(
+            decision=Decision.REJECTED,
+            released_budget_cents=0,
+            daily_budget_remaining_cents=0,
+            rejection_guidance=f"Voucher release failed: {status_code}",
+        )
 
     current_budget = await r.get(budget_day)
     remaining_daily = int(current_budget) if current_budget is not None else config.daily_cap_cents

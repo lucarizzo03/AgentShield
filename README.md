@@ -8,18 +8,59 @@ This repository implements a two-plane payment control system:
 The Brain decides *what to try next*.  
 The Gateway decides *whether spending is allowed right now*.
 
+## Quickstart
+
+1. Start Redis
+```bash
+docker run -d -p 6379:6379 redis
+```
+
+2. Set env vars
+```bash
+export REDIS_URL="redis://localhost:6379/0"
+export TEMPO_FALLBACK_ON_BLOCK=true
+export TEMPO_REQUEST_JSON='{"prompt":". . ."}'
+```
+
+3. Start API
+```bash
+python3 -m uvicorn agentShieldAPI:app --host 0.0.0.0 --port 8000
+```
+
+4. Run a real payment flow
+```bash
+curl -X POST http://127.0.0.1:8000/v1/process-payment \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent_id": "agent_alpha",
+    "task_description": "a sunset over the ocean",
+    "candidates": [
+      {
+        "description": "FAL Flux test",
+        "amount_cents": 5,
+        "currency": "USD",
+        "recipient": "https://fal.mpp.tempo.xyz/fal-ai/flux/dev",
+        "recurring": false
+      }
+    ],
+    "brain_max_cycles": 1,
+    "priority": "normal",
+    "mpp_mode": "real"
+  }'
+```
+
 ## Canonical End-to-End Flow
 
 1. Client calls `POST /v1/process-payment`.
 2. Brain picks a candidate and requests voucher budget via `POST /v1/request-voucher`.
 3. Gateway reserves budget (USD-normalized), creates voucher, returns `session_token`.
 4. Executor calls vendor endpoint without payment proof.
-5. Vendor returns `HTTP 402` with `mpp_challenge_id` (+ amount/currency when provided).
+5. If vendor returns `HTTP 402`, executor extracts `mpp_challenge_id` (+ amount/currency when provided).
 6. Executor calls `POST /v1/authorize-spend` with that exact challenge.
 7. Gateway runs replay + voucher checks, deducts voucher, returns `signed_payment_intent`.
 8. Executor retries vendor call with signed intent attached.
 9. Executor calls `POST /v1/release-voucher` to sweep any unused reserved budget.
-10. If execution fails, Brain moves to next candidate and repeats.
+10. If execution fails, orchestrator moves to the next candidate until success, candidate exhaustion, or `brain_max_cycles`.
 
 ## Architecture
 
@@ -172,7 +213,9 @@ Convenience orchestration endpoint:
 
 1. Runs the Brain candidate loop.
 2. Reserves voucher for a selected candidate.
-3. Executor performs HTTP 402 handshake (probe -> challenge -> authorize -> retry).
+3. Executor performs HTTP handshake:
+   - if vendor returns `200`, execution is considered successful without challenge.
+   - if vendor returns `402`, run challenge authorize + retry flow.
 4. Releases voucher residue (`/v1/release-voucher`) after each execution attempt.
 5. On failure, loops to next candidate.
 
@@ -184,6 +227,13 @@ Request highlights:
 - `brain_max_cycles`
 - `priority`
 - `mpp_mode` (`mock` or `real`)
+
+Execution response note:
+
+- `mpp_execution.execution_path` explicitly shows which transport path executed:
+  - `direct_402_http`
+  - `tempo_cli_fallback`
+  - `mock_adapter`
 
 ## Brain Loop (LangGraph)
 
@@ -199,9 +249,9 @@ Behavior:
 - The Brain does **not** force USD normalization.
 - The Brain reserves voucher budget and hands execution to the executor.
 - On any voucher failure or execution failure, the current candidate is treated as failed and the next candidate is tried.
-- Stop conditions:
-  - Approved
-  - Max cycles reached
+- Orchestration stop conditions:
+  - Approved execution
+  - `brain_max_cycles` reached
   - No candidates left
 
 ## Redis Key Model
@@ -211,7 +261,7 @@ Behavior:
 - Voucher balance:
   - `voucher:balance:{session_token}` -> remaining voucher cents
 - Voucher metadata hash:
-  - `voucher:meta:{session_token}` -> `agent_id`, `vendor_url`, `currency`, `created_at`
+  - `voucher:meta:{session_token}` -> `agent_id`, `vendor_url`, `currency`, `requested_vendor_cents`, `reserved_usd_cents`, `budget_key`
 - Replay protection:
   - `challenge:{mpp_challenge_id}` -> one-time marker with TTL
 
@@ -246,7 +296,6 @@ export REDIS_URL="redis://localhost:6379/0"
 ### Start API
 
 ```bash
-cd /Users/lucar/Desktop/AgentShield
 python3 -m uvicorn agentShieldAPI:app --host 0.0.0.0 --port 8000
 ```
 
@@ -303,7 +352,7 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
     ],
     "brain_max_cycles": 5,
     "priority": "normal",
-    "mpp_mode": "mock"
+    "mpp_mode": "real"
   }'
 ```
 
@@ -315,7 +364,7 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
   - authorize exact challenge via gateway
   - retry vendor request with signed intent
   - release unused voucher reservation
-  - if vendor edge blocks direct probe (e.g. HTTP 403/1010), optional fallback uses `tempo request` transport (`TEMPO_FALLBACK_ON_BLOCK=true`, default true)
+  - if vendor edge blocks direct probe (e.g. HTTP 403/1010), fallback uses `tempo request` transport (`TEMPO_FALLBACK_ON_BLOCK=true`, default true)
 
 ## Current Limitations
 
@@ -337,3 +386,11 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
 - Gateway daily budget is tracked in base currency (USD cents).
 - On `request-voucher`, Gateway converts requested foreign currency amount into USD cents using an FX rate table/oracle before reserving from `budget:daily:*`.
 - Voucher spend still occurs in vendor-requested cents/currency; release logic returns the proportional unused USD reservation.
+
+## Runtime Env Vars
+
+- `REDIS_URL` (default `redis://localhost:6379/0`)
+- `FX_RATES_TO_USD_JSON` (optional JSON map, e.g. `{"EUR":1.08,"USD":1.0}`)
+- `TEMPO_FALLBACK_ON_BLOCK` (default `true`)
+- `TEMPO_REQUEST_TIMEOUT_SECONDS`, `TEMPO_REQUEST_CONNECT_TIMEOUT_SECONDS`, `TEMPO_REQUEST_RETRIES`, `TEMPO_REQUEST_RETRY_BACKOFF_MS`
+- `TEMPO_REQUEST_METHOD`, `TEMPO_REQUEST_JSON`, `TEMPO_NETWORK`
