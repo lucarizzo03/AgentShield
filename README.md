@@ -8,6 +8,60 @@ This repository implements a two-plane payment control system:
 The Brain decides *what to try next*.  
 The Gateway decides *whether spending is allowed right now*.
 
+## 1-Click Docker Run
+
+```bash
+docker compose up --build -d
+```
+
+Authenticate Tempo wallet on your host first (uses your normal browser/passkey):
+
+```bash
+tempo wallet login
+tempo wallet whoami
+```
+
+The API container reuses your host wallet/session directory (`${HOME}/.tempo`) while still using a Linux `tempo` binary inside the container.
+
+Wait for containers to become healthy, then test:
+
+```bash
+curl -s http://127.0.0.1:8000/v1/ledger/agent_alpha | jq
+```
+
+Run a payment flow:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/v1/process-payment \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent_id": "agent_alpha",
+    "task_description": "a sunset over the ocean",
+    "candidates": [
+      {
+        "description": "FAL Flux test",
+        "amount_cents": 5,
+        "currency": "USD",
+        "recipient": "https://fal.mpp.tempo.xyz/fal-ai/flux/dev",
+        "recurring": false
+      }
+    ],
+    "brain_max_cycles": 1,
+    "priority": "normal",
+    "mpp_mode": "real"
+  }' | jq
+```
+
+Stop everything:
+
+```bash
+docker compose down
+```
+
+Notes:
+- Real payments in Docker use in-container `tempo` CLI.
+- Wallet/session is shared from host `${HOME}/.tempo`.
+
 ## Quickstart
 
 1. Start Redis
