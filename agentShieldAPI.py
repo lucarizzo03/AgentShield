@@ -26,6 +26,7 @@ fastapi_module = importlib.import_module("fastapi")
 FastAPI = fastapi_module.FastAPI
 HTTPException = fastapi_module.HTTPException
 Request = fastapi_module.Request
+Response = fastapi_module.Response
 
 
 class Decision(str, Enum):
@@ -110,6 +111,7 @@ class MPPExecutionResult(BaseModel):
     vendor_http_status: Optional[int] = None
     vendor_response_preview: Optional[str] = None
     vendor_response_json: Optional[Dict[str, Any]] = None
+    payment_receipt: Optional[str] = None
     message: str
     executed_at: str
 
@@ -609,9 +611,29 @@ def _build_vendor_request(
     if method in {"POST", "PUT", "PATCH"}:
         data = json.dumps(payload).encode("utf-8")
     if signed_payment_intent:
-        headers["Authorization"] = f"Bearer {signed_payment_intent}"
+        # Prefer RFC-style MPP auth scheme while keeping legacy header compatibility.
+        headers["Authorization"] = f"Payment {signed_payment_intent}"
         headers["X-MPP-Payment-Intent"] = signed_payment_intent
+        headers["X-Signed-Payment-Intent"] = signed_payment_intent
     return urllib_request.Request(url, data=data, headers=headers, method=method)
+
+
+def _parse_www_authenticate_payment(header_value: str) -> Dict[str, Optional[str]]:
+    if not header_value:
+        return {"id": None, "amount_cents": None, "currency": None}
+    # Supports values like:
+    # Payment id="abc", method="tempo", amount_cents="5", currency="USD"
+    parsed: Dict[str, Optional[str]] = {"id": None, "amount_cents": None, "currency": None}
+    if " " not in header_value:
+        return parsed
+    scheme, _, params = header_value.partition(" ")
+    if scheme.strip().lower() != "payment":
+        return parsed
+    for key in ("id", "amount_cents", "currency"):
+        match = re.search(rf'{key}\s*=\s*"([^"]+)"', params, flags=re.IGNORECASE)
+        if match:
+            parsed[key] = match.group(1)
+    return parsed
 
 
 def _extract_402_details(exc: HTTPError) -> Dict[str, object]:
@@ -626,19 +648,26 @@ def _extract_402_details(exc: HTTPError) -> Dict[str, object]:
             body = {}
 
     headers = {k.lower(): v for k, v in dict(exc.headers.items()).items()} if exc.headers else {}
+    parsed_www = _parse_www_authenticate_payment(headers.get("www-authenticate", ""))
     challenge_id = (
+        parsed_www.get("id")
+        or
         headers.get("x-mpp-challenge-id")
         or headers.get("mpp-challenge-id")
         or body.get("mpp_challenge_id")
         or body.get("challenge_id")
     )
     amount_cents = (
+        parsed_www.get("amount_cents")
+        or
         headers.get("x-mpp-amount-cents")
         or headers.get("mpp-amount-cents")
         or body.get("amount_cents")
         or body.get("required_amount_cents")
     )
     currency = (
+        parsed_www.get("currency")
+        or
         headers.get("x-mpp-currency")
         or headers.get("mpp-currency")
         or body.get("currency")
@@ -648,6 +677,7 @@ def _extract_402_details(exc: HTTPError) -> Dict[str, object]:
         "challenge_id": str(challenge_id) if challenge_id else "",
         "currency": str(currency),
         "raw_body": raw_body,
+        "www_authenticate": headers.get("www-authenticate", ""),
     }
     try:
         out["amount_cents"] = int(amount_cents) if amount_cents is not None else None
@@ -761,6 +791,11 @@ def _execute_via_tempo_cli(*, vendor_url: str, task_description: str, max_spend_
 
     parsed = parsed_stdout or {}
     tx_id = parsed.get("transaction_id") or parsed.get("id")
+    receipt = (
+        parsed.get("payment_receipt")
+        or parsed.get("receipt")
+        or parsed.get("paymentReceipt")
+    )
     if not tx_id:
         match = re.search(r"(tx_[A-Za-z0-9_-]+|mpp_[A-Za-z0-9_-]+)", stdout)
         tx_id = match.group(1) if match else None
@@ -773,6 +808,7 @@ def _execute_via_tempo_cli(*, vendor_url: str, task_description: str, max_spend_
         vendor_http_status=200,
         vendor_response_preview=_preview_text(stdout) if stdout else None,
         vendor_response_json=parsed if parsed else None,
+        payment_receipt=str(receipt) if receipt else None,
         message="Payment executed via tempo CLI fallback transport.",
         executed_at=utc_now_iso(),
     )
@@ -806,6 +842,7 @@ async def execute_mpp_402_handshake(
         with urllib_request.urlopen(initial_req, timeout=20) as resp:
             body = resp.read().decode("utf-8")
             parsed_body = _try_parse_json(body)
+            payment_receipt = resp.headers.get("Payment-Receipt")
             return MPPExecutionResult(
                 attempted=True,
                 status="SUCCEEDED",
@@ -815,6 +852,7 @@ async def execute_mpp_402_handshake(
                 vendor_http_status=resp.status,
                 vendor_response_preview=_preview_text(body) if body else None,
                 vendor_response_json=parsed_body,
+                payment_receipt=payment_receipt,
                 message="Vendor request succeeded without 402 challenge.",
                 executed_at=utc_now_iso(),
             )
@@ -896,6 +934,7 @@ async def execute_mpp_402_handshake(
             body = resp.read().decode("utf-8")
             parsed_body = _try_parse_json(body)
             tx_id = resp.headers.get("x-mpp-transaction-id") or resp.headers.get("x-transaction-id")
+            payment_receipt = resp.headers.get("Payment-Receipt")
             return MPPExecutionResult(
                 attempted=True,
                 status="SUCCEEDED",
@@ -905,6 +944,7 @@ async def execute_mpp_402_handshake(
                 vendor_http_status=resp.status,
                 vendor_response_preview=_preview_text(body) if body else None,
                 vendor_response_json=parsed_body,
+                payment_receipt=payment_receipt,
                 message="402 challenge authorized and vendor request succeeded on retry.",
                 executed_at=utc_now_iso(),
             )
@@ -1120,6 +1160,76 @@ async def get_agent_ledger(agent_id: str, request: Request) -> Dict[str, int | s
         "daily_spent_cents": max(0, spent),
         "daily_budget_remaining_cents": remaining,
     }
+
+
+@app.api_route("/v1/test/direct-402-vendor", methods=["GET", "POST"])
+async def direct_402_conformance_vendor(request: Request) -> Response:
+    """
+    Local conformance vendor used to prove direct HTTP 402 handshake behavior.
+    - First request (without payment credential) -> 402 + WWW-Authenticate: Payment.
+    - Retry with Authorization: Payment <signed_intent> -> 200 + Payment-Receipt.
+    """
+    auth_header = request.headers.get("authorization", "").strip()
+    x_intent = request.headers.get("x-mpp-payment-intent", "").strip()
+    token = ""
+    if auth_header.lower().startswith("payment "):
+        token = auth_header.split(" ", 1)[1].strip()
+    elif auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+    elif x_intent:
+        token = x_intent
+
+    if not token:
+        challenge_id = f"local_ch_{secrets.token_hex(8)}"
+        amount_cents = 7
+        body = {
+            "type": "https://mpp.dev/problems/payment-required",
+            "title": "Payment Required",
+            "status": 402,
+            "mpp_challenge_id": challenge_id,
+            "amount_cents": amount_cents,
+            "currency": "USD",
+        }
+        headers = {
+            "WWW-Authenticate": (
+                f'Payment id="{challenge_id}", method="tempo", intent="charge", '
+                f'amount_cents="{amount_cents}", currency="USD"'
+            ),
+            "X-MPP-Challenge-Id": challenge_id,
+            "X-MPP-Amount-Cents": str(amount_cents),
+            "X-MPP-Currency": "USD",
+            "Content-Type": "application/json",
+        }
+        return Response(content=json.dumps(body), status_code=402, headers=headers, media_type="application/json")
+
+    verified = verify_and_unpack_signed_intent(token)
+    if not verified:
+        return Response(
+            content=json.dumps({"title": "Invalid payment credential", "status": 401}),
+            status_code=401,
+            media_type="application/json",
+        )
+    challenge_id = str(verified.get("mpp_challenge_id", ""))
+    if not challenge_id.startswith("local_ch_"):
+        return Response(
+            content=json.dumps({"title": "Challenge binding mismatch", "status": 401}),
+            status_code=401,
+            media_type="application/json",
+        )
+
+    receipt = f"receipt_local_{secrets.token_hex(8)}"
+    tx_id = f"tx_local_{secrets.token_hex(8)}"
+    payload = {
+        "ok": True,
+        "asset": "conformance_sample",
+        "message": "Direct 402 handshake completed.",
+    }
+    headers = {
+        "Payment-Receipt": receipt,
+        "X-MPP-Transaction-Id": tx_id,
+        "Content-Type": "application/json",
+    }
+    return Response(content=json.dumps(payload), status_code=200, headers=headers, media_type="application/json")
 
 
 @app.post("/v1/process-payment", response_model=ProcessPaymentResponse)

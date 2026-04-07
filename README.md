@@ -299,6 +299,7 @@ Execution response note:
 - `mpp_execution.vendor_http_status` includes the vendor HTTP status when available.
 - `mpp_execution.vendor_response_preview` includes a truncated copy of the vendor/transport response payload.
 - `mpp_execution.vendor_response_json` includes parsed JSON payload (when the response is valid JSON).
+- `mpp_execution.payment_receipt` includes `Payment-Receipt` when provided by the vendor.
 
 ## Brain Loop (LangGraph)
 
@@ -392,6 +393,7 @@ curl -X POST http://127.0.0.1:8000/v1/authorize-spend \
 ```
 
 Use the exact challenge ID returned by the vendor `HTTP 402` (typically from `x-mpp-challenge-id`).
+When present, prefer the MPP-standard `WWW-Authenticate: Payment` challenge `id`.
 
 ### 3) Full process-payment
 
@@ -422,6 +424,29 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
     "mpp_mode": "real"
   }'
 ```
+
+### 4) Direct 402 conformance test
+
+This script starts a temporary local vendor that enforces `402 -> authorize -> retry` and checks:
+- `execution_path == direct_402_http`
+- `mpp_execution.payment_receipt` is present
+
+```bash
+python3 direct_402_conformance_test.py
+```
+
+If the API is running in Docker, use:
+
+```bash
+python3 direct_402_conformance_test.py --bind-host 0.0.0.0 --vendor-host host.docker.internal
+```
+
+Or call the built-in local conformance vendor endpoint directly as a candidate:
+
+- `POST /v1/test/direct-402-vendor`
+- `GET /v1/test/direct-402-vendor`
+
+This endpoint is for protocol/conformance testing only (not production vendor traffic).
 
 ## MPP Adapter Modes
 
@@ -459,5 +484,6 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
 - `REDIS_URL` (default `redis://localhost:6379/0`)
 - `FX_RATES_TO_USD_JSON` (optional JSON map, e.g. `{"EUR":1.08,"USD":1.0}`)
 - `TEMPO_FALLBACK_ON_BLOCK` (default `true`)
+- `TEMPO_USE_CLI` (default `true`)
 - `TEMPO_REQUEST_TIMEOUT_SECONDS`, `TEMPO_REQUEST_CONNECT_TIMEOUT_SECONDS`, `TEMPO_REQUEST_RETRIES`, `TEMPO_REQUEST_RETRY_BACKOFF_MS`
 - `TEMPO_REQUEST_METHOD`, `TEMPO_REQUEST_JSON`, `TEMPO_NETWORK`
