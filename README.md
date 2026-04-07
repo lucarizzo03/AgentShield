@@ -8,7 +8,13 @@ This repository implements a two-plane payment control system:
 The Brain decides *what to try next*.  
 The Gateway decides *whether spending is allowed right now*.
 
-## 1-Click Docker Run
+Choose one setup path:
+- Docker path below: easiest for first-time users.
+- Local Dev path below: best for editing code and debugging.
+
+## Quickstart (Docker - Recommended)
+
+Best for users cloning from GitHub who want the fastest path to a working API.
 
 ```bash
 docker compose up --build -d
@@ -62,7 +68,9 @@ Notes:
 - Real payments in Docker use in-container `tempo` CLI.
 - Wallet/session is shared from host `${HOME}/.tempo`.
 
-## Quickstart
+## Quickstart (Local Dev)
+
+Best for development/debugging when you want to run Python directly without rebuilding containers.
 
 1. Start Redis
 ```bash
