@@ -58,6 +58,37 @@ curl -s -X POST http://127.0.0.1:8000/v1/process-payment \
   }' | jq
 ```
 
+Successful run example (real purchase):
+
+```json
+{
+  "decision": "APPROVED",
+  "mpp_execution": {
+    "status": "SUCCEEDED",
+    "provider": "tempo-cli",
+    "execution_path": "tempo_cli_fallback",
+    "vendor_http_status": 200,
+    "vendor_response_json": {
+      "images": [
+        {
+          "url": "https://v3b.fal.media/files/b/0a9557b9/hF8ZUFEGvZyQm00Ev8UAL.jpg",
+          "width": 1024,
+          "height": 768,
+          "content_type": "image/jpeg"
+        }
+      ],
+      "prompt": ". . ."
+    },
+    "payment_receipt": null
+  }
+}
+```
+
+Notes:
+- `decision=APPROVED` + `mpp_execution.status=SUCCEEDED` means purchase completed.
+- `vendor_response_json` is the actual payload you bought (for this endpoint, generated image metadata).
+- `payment_receipt` may be `null` on `tempo_cli_fallback`; it is populated when vendor returns `Payment-Receipt`.
+
 Stop everything:
 
 ```bash
