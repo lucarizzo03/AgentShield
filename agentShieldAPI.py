@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -38,9 +39,11 @@ class Decision(str, Enum):
 class GatewayConfig:
     """Runtime knobs for Redis-backed gateway behavior."""
 
-    daily_cap_cents: int = 5000
-    voucher_ttl_seconds: int = 900
-    challenge_ttl_seconds: int = 300
+    daily_cap_cents: int = field(default_factory=lambda: int(os.getenv("DAILY_CAP_CENTS", "5000")))
+    voucher_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("VOUCHER_TTL_SECONDS", "900")))
+    challenge_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("CHALLENGE_TTL_SECONDS", "300")))
+    sweep_interval_seconds: int = field(default_factory=lambda: int(os.getenv("SWEEP_INTERVAL_SECONDS", "15")))
+    sweep_batch_size: int = field(default_factory=lambda: int(os.getenv("SWEEP_BATCH_SIZE", "100")))
     signing_secret: str = field(default_factory=lambda: secrets.token_hex(32))
     redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 
@@ -172,7 +175,6 @@ if current_budget >= requested_usd then
         "reserved_usd_cents", requested_usd,
         "budget_key", budget_key
     )
-    redis.call("EXPIRE", meta_key, ttl_seconds)
     local remaining_budget = current_budget - requested_usd
     return {1, remaining_budget, "APPROVED"}
 else
@@ -211,6 +213,9 @@ end
 RELEASE_VOUCHER_LUA = """
 local voucher_key = KEYS[1]
 local meta_key = KEYS[2]
+local index_key = KEYS[3]
+
+local session_token = ARGV[1]
 
 local balance_str = redis.call("GET", voucher_key)
 if not balance_str then
@@ -235,8 +240,64 @@ end
 
 redis.call("DEL", voucher_key)
 redis.call("DEL", meta_key)
+redis.call("ZREM", index_key, session_token)
 
 return {1, refund_usd, "RELEASED"}
+"""
+
+
+SWEEP_EXPIRED_VOUCHER_LUA = """
+local voucher_key = KEYS[1]
+local meta_key = KEYS[2]
+local index_key = KEYS[3]
+
+local session_token = ARGV[1]
+local now_epoch = tonumber(ARGV[2])
+
+local meta = redis.call("HMGET", meta_key, "requested_vendor_cents", "reserved_usd_cents", "budget_key", "spent_vendor_cents", "expires_at_epoch")
+local requested_vendor = tonumber(meta[1])
+local reserved_usd = tonumber(meta[2])
+local budget_key = meta[3]
+local spent_vendor = tonumber(meta[4]) or 0
+local expires_at = tonumber(meta[5]) or 0
+
+if not budget_key then
+    redis.call("ZREM", index_key, session_token)
+    return {0, 0, "META_NOT_FOUND"}
+end
+
+if expires_at > 0 and now_epoch < expires_at then
+    return {0, 0, "NOT_EXPIRED"}
+end
+
+local remaining_vendor = 0
+local balance_str = redis.call("GET", voucher_key)
+if balance_str then
+    remaining_vendor = tonumber(balance_str) or 0
+elseif requested_vendor and requested_vendor > 0 then
+    local used_vendor = spent_vendor
+    if used_vendor < 0 then
+        used_vendor = 0
+    end
+    if used_vendor > requested_vendor then
+        used_vendor = requested_vendor
+    end
+    remaining_vendor = requested_vendor - used_vendor
+end
+
+local refund_usd = 0
+if requested_vendor and requested_vendor > 0 and reserved_usd and reserved_usd > 0 and remaining_vendor > 0 then
+    refund_usd = math.floor((remaining_vendor / requested_vendor) * reserved_usd)
+end
+
+if refund_usd > 0 then
+    redis.call("INCRBY", budget_key, refund_usd)
+end
+
+redis.call("DEL", voucher_key)
+redis.call("DEL", meta_key)
+redis.call("ZREM", index_key, session_token)
+return {1, refund_usd, "SWEEPED"}
 """
 
 
@@ -246,7 +307,28 @@ async def lifespan(app: FastAPI):
     # Fail fast if Redis is unavailable.
     await app.state.redis.ping()
     await ensure_legacy_agents_seeded(app.state.redis)
+    stop_sweeper = asyncio.Event()
+
+    async def _sweeper_loop() -> None:
+        while not stop_sweeper.is_set():
+            try:
+                await sweep_expired_vouchers_once(app.state.redis)
+            except Exception:
+                # Keep sweeper resilient; request path remains authoritative.
+                pass
+            try:
+                await asyncio.wait_for(stop_sweeper.wait(), timeout=max(1, config.sweep_interval_seconds))
+            except asyncio.TimeoutError:
+                continue
+
+    sweeper_task = asyncio.create_task(_sweeper_loop())
     yield
+    stop_sweeper.set()
+    sweeper_task.cancel()
+    try:
+        await sweeper_task
+    except Exception:
+        pass
     await app.state.redis.aclose()
 
 
@@ -278,6 +360,10 @@ def voucher_meta_key(session_token: str) -> str:
 
 def challenge_key(mpp_challenge_id: str) -> str:
     return f"challenge:{mpp_challenge_id}"
+
+
+def voucher_expiry_index_key() -> str:
+    return "voucher:open:index"
 
 
 def agent_meta_key(agent_id: str) -> str:
@@ -1089,6 +1175,7 @@ async def request_voucher_core(r: redis.Redis, payload: RequestVoucherRequest) -
     balance_key = voucher_balance_key(session_token)
     meta_key = voucher_meta_key(session_token)
     vendor = normalize_vendor(payload.vendor_url)
+    expires_at_epoch = int(datetime.now(timezone.utc).timestamp()) + max(1, config.voucher_ttl_seconds)
     reserve_raw = await r.eval(
         RESERVE_DAILY_BUDGET_LUA,
         3,
@@ -1119,6 +1206,15 @@ async def request_voucher_core(r: redis.Redis, payload: RequestVoucherRequest) -
                 else f"Voucher reservation rejected: {status_code}"
             ),
         )
+
+    await r.hset(
+        meta_key,
+        mapping={
+            "spent_vendor_cents": 0,
+            "expires_at_epoch": expires_at_epoch,
+        },
+    )
+    await r.zadd(voucher_expiry_index_key(), {session_token: expires_at_epoch})
 
     return RequestVoucherResponse(
         decision=Decision.APPROVED,
@@ -1159,6 +1255,7 @@ async def authorize_spend_core(r: redis.Redis, payload: AuthorizeSpendRequest) -
             rejection_guidance=guidance,
         )
 
+    await r.hincrby(meta_key, "spent_vendor_cents", payload.amount_cents)
     voucher_meta = await r.hgetall(meta_key)
     signed_payload = {
         "agent_id": voucher_meta.get("agent_id", ""),
@@ -1189,7 +1286,14 @@ async def release_voucher_core(r: redis.Redis, payload: ReleaseVoucherRequest) -
             daily_budget_remaining_cents=0,
             rejection_guidance="Voucher metadata not found (already released or expired).",
         )
-    release_raw = await r.eval(RELEASE_VOUCHER_LUA, 2, balance_key, meta_key)
+    release_raw = await r.eval(
+        RELEASE_VOUCHER_LUA,
+        3,
+        balance_key,
+        meta_key,
+        voucher_expiry_index_key(),
+        payload.session_token,
+    )
     release = list(release_raw) if isinstance(release_raw, (list, tuple)) else [0, 0, "UNKNOWN"]
     released_ok = int(release[0]) if len(release) > 0 else 0
     released_budget_cents = int(release[1]) if len(release) > 1 else 0
@@ -1210,6 +1314,38 @@ async def release_voucher_core(r: redis.Redis, payload: ReleaseVoucherRequest) -
         daily_budget_remaining_cents=remaining_daily,
         rejection_guidance=None,
     )
+
+
+async def sweep_expired_vouchers_once(r: redis.Redis) -> int:
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
+    expired_tokens = await r.zrangebyscore(
+        voucher_expiry_index_key(),
+        min="-inf",
+        max=now_epoch,
+        start=0,
+        num=max(1, config.sweep_batch_size),
+    )
+    if not expired_tokens:
+        return 0
+
+    swept = 0
+    for session_token in expired_tokens:
+        balance_key = voucher_balance_key(session_token)
+        meta_key = voucher_meta_key(session_token)
+        sweep_raw = await r.eval(
+            SWEEP_EXPIRED_VOUCHER_LUA,
+            3,
+            balance_key,
+            meta_key,
+            voucher_expiry_index_key(),
+            session_token,
+            now_epoch,
+        )
+        out = list(sweep_raw) if isinstance(sweep_raw, (list, tuple)) else [0, 0, "UNKNOWN"]
+        ok = int(out[0]) if len(out) > 0 else 0
+        if ok == 1:
+            swept += 1
+    return swept
 
 
 @app.post("/v1/register-agent", response_model=RegisterAgentResponse)

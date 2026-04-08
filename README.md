@@ -8,6 +8,9 @@ This repository implements a two-plane payment control system:
 The Brain decides *what to try next*.  
 The Gateway decides *whether spending is allowed right now*.
 
+**What is Tempo Wallet?**  
+Tempo Wallet is the payment account used by this project when `mpp_mode="real"`. When a paid request executes, spend is settled through your Tempo Wallet balance (shown in the wallet as USDC.e on the Tempo network). In other words: yes, real value is being spent from the wallet you log into with `tempo wallet login`.
+
 Choose one setup path:
 - Docker path below: easiest for first-time users.
 - Local Dev path below: best for editing code and debugging.
@@ -282,6 +285,12 @@ Behavior:
 4. Creates voucher keys with TTL.
 5. Returns a `session_token`.
 
+TTL behavior note:
+
+- TTL expires voucher/session keys to prevent reuse.
+- A background sweeper detects expired vouchers and automatically credits unused reserved USD budget back to the daily cap.
+- Explicit `POST /v1/release-voucher` still performs immediate refund and cleanup when the client completes normally.
+
 Response fields:
 
 - `decision`: `APPROVED | REJECTED`
@@ -341,6 +350,10 @@ Behavior:
 2. Computes proportional remaining reserved budget in base currency (USD cents).
 3. Credits that amount back to the original daily budget key.
 4. Deletes voucher keys so the session cannot be reused.
+
+Important:
+
+- If a client crashes and never calls `release-voucher`, the expired voucher is reclaimed by the sweeper loop and unused budget is refunded automatically.
 
 Response fields:
 
@@ -540,6 +553,57 @@ Or call the built-in local conformance vendor endpoint directly as a candidate:
 
 This endpoint is for protocol/conformance testing only (not production vendor traffic).
 
+### 5) Zombie reservation test (auto-refund after TTL)
+
+This verifies the crash-safety path where a client reserves budget but never calls `release-voucher`.
+The expected result is that budget is automatically refunded after voucher TTL expiry + sweeper pass.
+
+For a fast local check, temporarily run API with short timings:
+
+```bash
+export VOUCHER_TTL_SECONDS=5
+export SWEEP_INTERVAL_SECONDS=2
+python3 -m uvicorn agentShieldAPI:app --host 0.0.0.0 --port 8000
+```
+
+Then run:
+
+```bash
+AGENT_ID="agent_zombie_test_$(date +%s)"
+API_KEY=$(curl -s -X POST http://127.0.0.1:8000/v1/register-agent \
+  -H "Content-Type: application/json" \
+  -d "{\"agent_id\":\"${AGENT_ID}\"}" | jq -r '.api_key')
+
+echo "Before reserve:"
+curl -s -H "x-agentshield-api-key: ${API_KEY}" \
+  "http://127.0.0.1:8000/v1/ledger/${AGENT_ID}" | jq
+
+SESSION=$(curl -s -X POST http://127.0.0.1:8000/v1/request-voucher \
+  -H "Content-Type: application/json" \
+  -H "x-agentshield-api-key: ${API_KEY}" \
+  -d "{
+    \"agent_id\": \"${AGENT_ID}\",
+    \"vendor_url\": \"https://fal.mpp.tempo.xyz/fal-ai/flux/dev\",
+    \"requested_amount_cents\": 5,
+    \"currency\": \"USD\"
+  }" | jq -r '.session_token')
+
+echo "After reserve (should be lower):"
+curl -s -H "x-agentshield-api-key: ${API_KEY}" \
+  "http://127.0.0.1:8000/v1/ledger/${AGENT_ID}" | jq
+
+echo "Waiting for TTL expiry + sweeper..."
+sleep 8
+
+echo "After sweep (should be refunded):"
+curl -s -H "x-agentshield-api-key: ${API_KEY}" \
+  "http://127.0.0.1:8000/v1/ledger/${AGENT_ID}" | jq
+```
+
+Expected:
+- second ledger call shows reduced `daily_budget_remaining_cents`
+- final ledger call returns back to original remaining budget without calling `release-voucher`
+
 ## MPP Adapter Modes
 
 - `mock`: returns synthetic `SUCCEEDED`.
@@ -574,6 +638,11 @@ This endpoint is for protocol/conformance testing only (not production vendor tr
 ## Runtime Env Vars
 
 - `REDIS_URL` (default `redis://localhost:6379/0`)
+- `DAILY_CAP_CENTS` (default `5000`)
+- `VOUCHER_TTL_SECONDS` (default `900`)
+- `CHALLENGE_TTL_SECONDS` (default `300`)
+- `SWEEP_INTERVAL_SECONDS` (default `15`)
+- `SWEEP_BATCH_SIZE` (default `100`)
 - `FX_RATES_TO_USD_JSON` (optional JSON map, e.g. `{"EUR":1.08,"USD":1.0}`)
 - `TEMPO_FALLBACK_ON_BLOCK` (default `true`)
 - `TEMPO_USE_CLI` (default `true`)
