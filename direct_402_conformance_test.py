@@ -88,11 +88,14 @@ class ConformanceVendorHandler(BaseHTTPRequestHandler):
         return
 
 
-def _post_json(url: str, payload: Dict[str, Any], timeout: float = 60.0) -> Dict[str, Any]:
+def _post_json(url: str, payload: Dict[str, Any], timeout: float = 60.0, headers: Dict[str, str] | None = None) -> Dict[str, Any]:
+    req_headers = {"Content-Type": "application/json"}
+    if headers:
+        req_headers.update(headers)
     req = urllib_request.Request(
         url=url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=req_headers,
         method="POST",
     )
     with urllib_request.urlopen(req, timeout=timeout) as resp:
@@ -106,7 +109,7 @@ def main() -> int:
     parser.add_argument("--bind-host", default="127.0.0.1")
     parser.add_argument("--vendor-host", default="127.0.0.1")
     parser.add_argument("--vendor-port", type=int, default=8765)
-    parser.add_argument("--agent-id", default="agent_alpha")
+    parser.add_argument("--agent-id", default=f"conformance_{int(time.time())}")
     parser.add_argument("--task", default="direct 402 conformance check")
     args = parser.parse_args()
 
@@ -116,6 +119,17 @@ def main() -> int:
     time.sleep(0.1)
 
     vendor_url = f"http://{args.vendor_host}:{args.vendor_port}/paid-resource"
+    register = _post_json(
+        f"{args.api_base_url.rstrip('/')}/v1/register-agent",
+        {"agent_id": args.agent_id},
+    )
+    if register.get("decision") != "APPROVED" or not register.get("api_key"):
+        print("Agent registration failed:")
+        print(json.dumps(register, indent=2))
+        return 1
+    api_key = str(register["api_key"])
+    auth_headers = {"x-agentshield-api-key": api_key}
+
     payload = {
         "agent_id": args.agent_id,
         "task_description": args.task,
@@ -134,7 +148,7 @@ def main() -> int:
     }
 
     try:
-        response = _post_json(f"{args.api_base_url.rstrip('/')}/v1/process-payment", payload)
+        response = _post_json(f"{args.api_base_url.rstrip('/')}/v1/process-payment", payload, headers=auth_headers)
     finally:
         server.shutdown()
         server.server_close()

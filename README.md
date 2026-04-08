@@ -12,6 +12,12 @@ Choose one setup path:
 - Docker path below: easiest for first-time users.
 - Local Dev path below: best for editing code and debugging.
 
+What you get:
+- Agent onboarding with API keys (`shield_sk_...`)
+- Redis-backed budget/voucher/replay protection
+- Real MPP execution with direct `402` handshake and Tempo fallback
+- Vendor payload + receipt capture in `mpp_execution`
+
 ## Quickstart (Docker - Recommended)
 
 Best for users cloning from GitHub who want the fastest path to a working API.
@@ -29,10 +35,12 @@ tempo wallet whoami
 
 The API container reuses your host wallet/session directory (`${HOME}/.tempo`) while still using a Linux `tempo` binary inside the container.
 
-Wait for containers to become healthy, then test:
+Register an agent and capture its API key:
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/ledger/agent_alpha | jq
+API_KEY=$(curl -s -X POST http://127.0.0.1:8000/v1/register-agent \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id":"agent_demo"}' | jq -r '.api_key')
 ```
 
 Run a payment flow:
@@ -40,8 +48,9 @@ Run a payment flow:
 ```bash
 curl -s -X POST http://127.0.0.1:8000/v1/process-payment \
   -H "Content-Type: application/json" \
+  -H "x-agentshield-api-key: ${API_KEY}" \
   -d '{
-    "agent_id": "agent_alpha",
+    "agent_id": "agent_demo",
     "task_description": "a sunset over the ocean",
     "candidates": [
       {
@@ -98,6 +107,7 @@ docker compose down
 Notes:
 - Real payments in Docker use in-container `tempo` CLI.
 - Wallet/session is shared from host `${HOME}/.tempo`.
+- Mutating/ledger endpoints require `x-agentshield-api-key`.
 
 ## Quickstart (Local Dev)
 
@@ -122,10 +132,15 @@ python3 -m uvicorn agentShieldAPI:app --host 0.0.0.0 --port 8000
 
 4. Run a real payment flow
 ```bash
-curl -X POST http://127.0.0.1:8000/v1/process-payment \
+API_KEY=$(curl -s -X POST http://127.0.0.1:8000/v1/register-agent \
   -H "Content-Type: application/json" \
+  -d '{"agent_id":"agent_demo_local"}' | jq -r '.api_key')
+
+curl -s -X POST http://127.0.0.1:8000/v1/process-payment \
+  -H "Content-Type: application/json" \
+  -H "x-agentshield-api-key: ${API_KEY}" \
   -d '{
-    "agent_id": "agent_alpha",
+    "agent_id": "agent_demo_local",
     "task_description": "a sunset over the ocean",
     "candidates": [
       {
@@ -139,7 +154,7 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
     "brain_max_cycles": 1,
     "priority": "normal",
     "mpp_mode": "real"
-  }'
+  }' | jq
 ```
 
 ## Canonical End-to-End Flow
@@ -198,7 +213,54 @@ curl -X POST http://127.0.0.1:8000/v1/process-payment \
 - Replay protection uses one-time `mpp_challenge_id` with 5-minute TTL.
 - Voucher and daily budget operations are atomic in Redis.
 
+## Auth Model (At A Glance)
+
+1. Register agent: `POST /v1/register-agent` -> returns `api_key`.
+2. Send header on protected endpoints: `x-agentshield-api-key: <api_key>`.
+3. Gateway enforces:
+   - API key must exist in Redis.
+   - API key owner must match `payload.agent_id`.
+   - Session-token actions must be performed by the same owning agent.
+4. Revoke immediately: `POST /v1/revoke-api-key`.
+
 ## Gateway Endpoints
+
+### `POST /v1/register-agent`
+
+Onboards a new agent and returns an API key used to authenticate all protected endpoints.
+
+Request:
+
+- `agent_id` (string, `[a-zA-Z0-9_-]{3,64}`)
+
+Response fields:
+
+- `decision`
+- `agent_id` (nullable)
+- `api_key` (nullable)
+- `rejection_guidance` (nullable)
+
+API key format:
+
+- `shield_sk_<secure_random>`
+
+---
+
+### `POST /v1/revoke-api-key`
+
+Instantly revokes the currently presented API key.
+
+Request:
+
+- `x-agentshield-api-key` header (required)
+
+Response fields:
+
+- `decision`
+- `revoked` (bool)
+- `rejection_guidance` (nullable)
+
+---
 
 ### `POST /v1/request-voucher`
 
@@ -206,6 +268,7 @@ Brain calls this before vendor API spending.
 
 Request:
 
+- `x-agentshield-api-key` header (required)
 - `agent_id` (string)
 - `vendor_url` (string)
 - `requested_amount_cents` (int > 0)
@@ -235,6 +298,7 @@ Hot path used for each MPP 402 challenge.
 
 Request:
 
+- `x-agentshield-api-key` header (required)
 - `session_token` (string)
 - `mpp_challenge_id` (string)
 - `amount_cents` (int > 0)
@@ -267,6 +331,7 @@ Releases unused voucher value back into the daily budget reservation pool.
 
 Request:
 
+- `x-agentshield-api-key` header (required)
 - `session_token` (string)
 - `reason` (string, optional)
 
@@ -298,6 +363,10 @@ Returns:
 - `daily_spent_cents`
 - `daily_budget_remaining_cents`
 
+Requires:
+
+- `x-agentshield-api-key` header bound to the same `{agent_id}`
+
 ---
 
 ### `POST /v1/process-payment`
@@ -314,6 +383,7 @@ Convenience orchestration endpoint:
 
 Request highlights:
 
+- `x-agentshield-api-key` header (required; must match `agent_id`)
 - `agent_id`
 - `task_description`
 - `candidates` (each candidate uses `amount_cents`)
@@ -355,6 +425,10 @@ Behavior:
 
 - Daily budget:
   - `budget:daily:{agent_id}:{YYYYMMDD}` -> remaining daily cents
+- Agent metadata:
+  - `agent:meta:{agent_id}` -> `agent_id`, `status`, `created_at`, `source`
+- API key mapping:
+  - `apikey:{api_key}` -> `agent_id`
 - Voucher balance:
   - `voucher:balance:{session_token}` -> remaining voucher cents
 - Voucher metadata hash:
@@ -362,49 +436,34 @@ Behavior:
 - Replay protection:
   - `challenge:{mpp_challenge_id}` -> one-time marker with TTL
 
-## Running Locally
+## Developer Setup Notes
 
-### Prerequisites
-
-- Python 3.11+ (or compatible runtime)
-- Redis running locally
-- Python packages:
-  - `fastapi`
-  - `uvicorn`
-  - `pydantic`
-  - `langgraph`
-  - `redis`
-- Tempo CLI installed and logged in (only required for `mpp_mode="real"` recommended path):
+- Python: `3.11+`
+- Required packages: `fastapi`, `uvicorn`, `pydantic`, `langgraph`, `redis`
+- Real-mode execution requires Tempo CLI login:
   - `tempo --version`
   - `tempo wallet login`
-
-### Start Redis
-
-```bash
-docker run -d -p 6379:6379 redis
-```
-
-If Docker is unavailable, run Redis any other way and set:
-
-```bash
-export REDIS_URL="redis://localhost:6379/0"
-```
-
-### Start API
-
-```bash
-python3 -m uvicorn agentShieldAPI:app --host 0.0.0.0 --port 8000
-```
+- Redis default URL:
+  - `redis://localhost:6379/0`
 
 ## Example Requests
+
+### 0) Register agent
+
+```bash
+API_KEY=$(curl -s -X POST http://127.0.0.1:8000/v1/register-agent \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id":"agent_docs_demo"}' | jq -r '.api_key')
+```
 
 ### 1) Request voucher
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/request-voucher \
   -H "Content-Type: application/json" \
+  -H "x-agentshield-api-key: ${API_KEY}" \
   -d '{
-    "agent_id": "agent_alpha",
+    "agent_id": "agent_docs_demo",
     "vendor_url": "https://fal.mpp.tempo.xyz/fal-ai/flux/dev",
     "requested_amount_cents": 5,
     "currency": "USD"
@@ -416,6 +475,7 @@ curl -X POST http://127.0.0.1:8000/v1/request-voucher \
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/authorize-spend \
   -H "Content-Type: application/json" \
+  -H "x-agentshield-api-key: ${API_KEY}" \
   -d '{
     "session_token": "REPLACE_WITH_SESSION_TOKEN",
     "mpp_challenge_id": "mpp_ch_01JQ7F2X9Y4R8K3T6N1B5V",
@@ -431,8 +491,9 @@ When present, prefer the MPP-standard `WWW-Authenticate: Payment` challenge `id`
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/process-payment \
   -H "Content-Type: application/json" \
+  -H "x-agentshield-api-key: ${API_KEY}" \
   -d '{
-    "agent_id": "agent_alpha",
+    "agent_id": "agent_docs_demo",
     "task_description": "a sunset over the ocean",
     "candidates": [
       {
@@ -491,7 +552,7 @@ This endpoint is for protocol/conformance testing only (not production vendor tr
 
 ## Current Limitations
 
-- API endpoints currently have no auth layer.
+- API uses simple API-key auth; scoped roles and full key rotation UX are not yet implemented.
 - Vendor trust/verification is minimal and should be hardened.
 - Challenge parsing currently relies on common header/body conventions; vendor-specific adapters may still be required.
 

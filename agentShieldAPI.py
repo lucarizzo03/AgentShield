@@ -122,8 +122,25 @@ class ProcessPaymentResponse(BaseModel):
     mpp_execution: MPPExecutionResult
 
 
+class RegisterAgentRequest(BaseModel):
+    agent_id: str = Field(min_length=3, max_length=64)
+
+
+class RegisterAgentResponse(BaseModel):
+    decision: Decision
+    agent_id: Optional[str]
+    api_key: Optional[str]
+    rejection_guidance: Optional[str]
+
+
+class RevokeApiKeyResponse(BaseModel):
+    decision: Decision
+    revoked: bool
+    rejection_guidance: Optional[str]
+
+
 config = GatewayConfig()
-registered_agents = {"agent_alpha", "agent_beta", "agent_ops"}
+legacy_registered_agents = {"agent_alpha", "agent_beta", "agent_ops"}
 
 
 RESERVE_DAILY_BUDGET_LUA = """
@@ -228,11 +245,15 @@ async def lifespan(app: FastAPI):
     app.state.redis = redis.from_url(config.redis_url, decode_responses=True)
     # Fail fast if Redis is unavailable.
     await app.state.redis.ping()
+    await ensure_legacy_agents_seeded(app.state.redis)
     yield
     await app.state.redis.aclose()
 
 
 app = FastAPI(title="Budget Shield Gateway", version="2.0.0", lifespan=lifespan)
+
+
+AGENT_API_KEY_HEADER = "x-agentshield-api-key"
 
 
 def utc_now_iso() -> str:
@@ -257,6 +278,72 @@ def voucher_meta_key(session_token: str) -> str:
 
 def challenge_key(mpp_challenge_id: str) -> str:
     return f"challenge:{mpp_challenge_id}"
+
+
+def agent_meta_key(agent_id: str) -> str:
+    return f"agent:meta:{agent_id}"
+
+
+def agent_api_key_key(api_key: str) -> str:
+    return f"apikey:{api_key}"
+
+
+def legacy_agent_api_key_key(api_key: str) -> str:
+    return f"agent:api-key:{api_key}"
+
+
+async def ensure_legacy_agents_seeded(r: redis.Redis) -> None:
+    for agent_id in legacy_registered_agents:
+        key = agent_meta_key(agent_id)
+        exists = await r.exists(key)
+        if exists:
+            continue
+        await r.hset(
+            key,
+            mapping={
+                "agent_id": agent_id,
+                "status": "active",
+                "created_at": utc_now_iso(),
+                "source": "legacy_bootstrap",
+            },
+        )
+
+
+async def is_registered_agent(r: redis.Redis, agent_id: str) -> bool:
+    return bool(await r.exists(agent_meta_key(agent_id)))
+
+
+async def resolve_agent_from_api_key(r: redis.Redis, api_key: str) -> Optional[str]:
+    if not api_key:
+        return None
+    value = await r.get(agent_api_key_key(api_key))
+    if value is None:
+        # Backward compatibility for early beta keys.
+        value = await r.get(legacy_agent_api_key_key(api_key))
+    return str(value) if value else None
+
+
+async def require_authenticated_agent(request: Request) -> str:
+    api_key = request.headers.get(AGENT_API_KEY_HEADER, "").strip()
+    if not api_key:
+        raise HTTPException(status_code=401, detail=f"Missing required header: {AGENT_API_KEY_HEADER}")
+    agent_id = await resolve_agent_from_api_key(request.app.state.redis, api_key)
+    if not agent_id:
+        raise HTTPException(status_code=401, detail="Invalid API key.")
+    return agent_id
+
+
+def ensure_actor_matches_payload_agent(actor_agent_id: str, payload_agent_id: str) -> None:
+    if actor_agent_id != payload_agent_id:
+        raise HTTPException(status_code=403, detail="API key does not match payload.agent_id.")
+
+
+async def ensure_session_owned_by_actor(r: redis.Redis, session_token: str, actor_agent_id: str) -> None:
+    owner = await r.hget(voucher_meta_key(session_token), "agent_id")
+    if not owner:
+        raise HTTPException(status_code=404, detail="Session token not found or expired.")
+    if owner != actor_agent_id:
+        raise HTTPException(status_code=403, detail="Session token belongs to a different agent.")
 
 
 def normalize_vendor(recipient: str) -> str:
@@ -975,7 +1062,7 @@ async def execute_mpp_402_handshake(
 
 
 async def request_voucher_core(r: redis.Redis, payload: RequestVoucherRequest) -> RequestVoucherResponse:
-    if payload.agent_id not in registered_agents:
+    if not await is_registered_agent(r, payload.agent_id):
         return RequestVoucherResponse(
             decision=Decision.REJECTED,
             session_token=None,
@@ -1125,27 +1212,102 @@ async def release_voucher_core(r: redis.Redis, payload: ReleaseVoucherRequest) -
     )
 
 
+@app.post("/v1/register-agent", response_model=RegisterAgentResponse)
+async def register_agent(payload: RegisterAgentRequest, request: Request) -> RegisterAgentResponse:
+    agent_id = payload.agent_id.strip()
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{3,64}", agent_id):
+        return RegisterAgentResponse(
+            decision=Decision.REJECTED,
+            agent_id=None,
+            api_key=None,
+            rejection_guidance="agent_id must match [a-zA-Z0-9_-]{3,64}.",
+        )
+    r = request.app.state.redis
+    if await is_registered_agent(r, agent_id):
+        return RegisterAgentResponse(
+            decision=Decision.REJECTED,
+            agent_id=None,
+            api_key=None,
+            rejection_guidance="agent_id already exists.",
+        )
+
+    api_key = "shield_sk_" + secrets.token_urlsafe(32)
+    await r.hset(
+        agent_meta_key(agent_id),
+        mapping={
+            "agent_id": agent_id,
+            "status": "active",
+            "created_at": utc_now_iso(),
+            "source": "api_register",
+        },
+    )
+    await r.set(agent_api_key_key(api_key), agent_id)
+    return RegisterAgentResponse(
+        decision=Decision.APPROVED,
+        agent_id=agent_id,
+        api_key=api_key,
+        rejection_guidance=None,
+    )
+
+
+@app.post("/v1/revoke-api-key", response_model=RevokeApiKeyResponse)
+async def revoke_api_key(request: Request) -> RevokeApiKeyResponse:
+    """
+    Revokes the currently presented API key immediately.
+    This gives instant kill-switch behavior without token expiry delays.
+    """
+    api_key = request.headers.get(AGENT_API_KEY_HEADER, "").strip()
+    if not api_key:
+        return RevokeApiKeyResponse(
+            decision=Decision.REJECTED,
+            revoked=False,
+            rejection_guidance=f"Missing required header: {AGENT_API_KEY_HEADER}",
+        )
+    r = request.app.state.redis
+    actor_agent_id = await resolve_agent_from_api_key(r, api_key)
+    if not actor_agent_id:
+        return RevokeApiKeyResponse(
+            decision=Decision.REJECTED,
+            revoked=False,
+            rejection_guidance="Invalid API key.",
+        )
+    deleted = await r.delete(agent_api_key_key(api_key), legacy_agent_api_key_key(api_key))
+    return RevokeApiKeyResponse(
+        decision=Decision.APPROVED,
+        revoked=bool(deleted),
+        rejection_guidance=None,
+    )
+
+
 @app.post("/v1/request-voucher", response_model=RequestVoucherResponse)
 async def request_voucher(payload: RequestVoucherRequest, request: Request) -> RequestVoucherResponse:
+    actor_agent_id = await require_authenticated_agent(request)
+    ensure_actor_matches_payload_agent(actor_agent_id, payload.agent_id)
     r = request.app.state.redis
     return await request_voucher_core(r, payload)
 
 
 @app.post("/v1/authorize-spend", response_model=AuthorizeSpendResponse)
 async def authorize_spend(payload: AuthorizeSpendRequest, request: Request) -> AuthorizeSpendResponse:
+    actor_agent_id = await require_authenticated_agent(request)
     r = request.app.state.redis
+    await ensure_session_owned_by_actor(r, payload.session_token, actor_agent_id)
     return await authorize_spend_core(r, payload)
 
 
 @app.post("/v1/release-voucher", response_model=ReleaseVoucherResponse)
 async def release_voucher(payload: ReleaseVoucherRequest, request: Request) -> ReleaseVoucherResponse:
+    actor_agent_id = await require_authenticated_agent(request)
     r = request.app.state.redis
+    await ensure_session_owned_by_actor(r, payload.session_token, actor_agent_id)
     return await release_voucher_core(r, payload)
 
 
 @app.get("/v1/ledger/{agent_id}")
 async def get_agent_ledger(agent_id: str, request: Request) -> Dict[str, int | str]:
-    if agent_id not in registered_agents:
+    actor_agent_id = await require_authenticated_agent(request)
+    ensure_actor_matches_payload_agent(actor_agent_id, agent_id)
+    if not await is_registered_agent(request.app.state.redis, agent_id):
         return {"status": "not_found", "agent_id": agent_id, "message": "agent not registered"}
 
     r = request.app.state.redis
@@ -1234,6 +1396,8 @@ async def direct_402_conformance_vendor(request: Request) -> Response:
 
 @app.post("/v1/process-payment", response_model=ProcessPaymentResponse)
 async def process_payment(payload: ProcessPaymentRequest, request: Request) -> ProcessPaymentResponse:
+    actor_agent_id = await require_authenticated_agent(request)
+    ensure_actor_matches_payload_agent(actor_agent_id, payload.agent_id)
     brain_module = importlib.import_module("agentShieldAgent")
     all_candidates = [
         brain_module.SpendCandidate(
