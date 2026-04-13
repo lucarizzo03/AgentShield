@@ -239,26 +239,3 @@ class AgentShieldBrain:
         with concurrent_futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(asyncio_module.run, awaitable)
             return future.result(timeout=20)
-
-
-if __name__ == "__main__":
-    brain = AgentShieldBrain(AgentBrainConfig(max_cycles=5, gateway_url="http://127.0.0.1:8000", priority="normal"))
-    task = "Scrape 500 real estate listings and enrich with owner contact data"
-    spend_options = [
-        SpendCandidate(
-            description="Primary data API",
-            amount_cents=75,
-            currency="USD",
-            recipient="https://realdataapi.com/v1/listings",
-            recurring=False,
-        ),
-        SpendCandidate(
-            description="Lower-cost backup API",
-            amount_cents=20,
-            currency="EUR",
-            recipient="https://datasourcehub.io/api/search",
-            recurring=False,
-        ),
-    ]
-    result = brain.run(agent_id="agent_alpha", task_description=task, candidates=spend_options)
-    print(json.dumps(result, indent=2))
